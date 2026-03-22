@@ -1,0 +1,11 @@
+{
+  "author": "Filip",
+  "github_id": "filipviz",
+  "name": "Glaucon",
+  "blurb": "Built on PR #315. Adds gated attention, brotli compression, and symmetric Muon update scaling. It also tweaks AdamW eps and Muon/AdamW weight decay.",
+  "date": "2026-03-22T00:00:00Z",
+  "val_loss": "",
+  "val_bpb": "",
+  "bytes_total": "",
+  "bytes_code": ""
+}
