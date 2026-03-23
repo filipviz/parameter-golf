@@ -1,8 +1,7 @@
 """
 Glaucon training script.
 
-Default profile: 11 layers with partial RoPE, LN scale, EMA, XSA4, gated attention,
-symmetric Muon scaling, and brotli compression for the 10-minute / 16 MB track.
+10-minute / 16 MB track.
 """
 
 from __future__ import annotations
@@ -37,8 +36,8 @@ from flash_attn_interface import flash_attn_func as flash_attn_3_func
 # -----------------------------
 # Default Glaucon run:
 # - 11 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA), tied embeddings, gated attention
-# - partial RoPE, LN scale, EMA, XSA4, and symmetric Muon scaling
+# - 8 attention heads with 4 KV heads (GQA), tied embeddings
+# - partial RoPE, LN scale, EMA, and symmetric Muon scaling
 # - 9000 iterations with a ~10 minute wallclock cap
 
 class Hyperparameters:
@@ -91,15 +90,10 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     muon_wd = float(os.environ.get("MUON_WD", 0.045))
     adam_wd = float(os.environ.get("ADAM_WD", 0.045))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-
-    attn_gate_dim = int(os.environ.get("ATTN_GATE_DIM", 12))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -304,7 +298,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,attn_gate",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -409,20 +403,16 @@ class DistributedTokenLoader:
 # TRANSFORMER MODULES
 # -----------------------------
 
-class RMSNorm(nn.Module):
-    def __init__(self, eps: float | None = None):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, x: Tensor) -> Tensor:
-        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
-
-
 class CastedLinear(nn.Linear):
-    def forward(self, x: Tensor) -> Tensor:
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__(in_features, out_features, bias=False)
 
+    def forward(self, x: Tensor) -> Tensor:
+        return F.linear(x, self.weight.to(x.dtype))
+
+
+def norm(x: Tensor) -> Tensor:
+    return F.rms_norm(x, (x.size(-1),))
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -480,7 +470,6 @@ class CausalSelfAttention(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         rope_dims: int = 0,
-        attn_gate_dim: int = 12,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -499,76 +488,22 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.attn_gate = nn.Parameter(torch.zeros(num_heads, attn_gate_dim, dtype=torch.float32))
-        self.rope_dims = rope_dims
         self.rotary = Rotary(self.head_dim, base=rope_base, rope_dims=rope_dims)
-        self.use_xsa = False
-
-    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
-        """Subtract self-value projection via GQA-aware reshape (no repeat_interleave)."""
-        B, T, H, D = y.shape
-        Hkv = v.size(-2)
-        group = H // Hkv
-        y_g = y.reshape(B, T, Hkv, group, D)
-        vn = F.normalize(v, dim=-1).unsqueeze(-2)
-        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
-        return (y_g - proj).reshape(B, T, H, D)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
+        q = norm(q)
+        k = norm(k)
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
         y = flash_attn_3_func(q, k, v, causal=True)
-        if self.use_xsa:
-            y = self._xsa_efficient(y, v)
-        gate = 2.0 * torch.sigmoid(F.linear(x[..., :self.attn_gate.size(-1)], self.attn_gate))  # (B, T, num_heads)
-        y = y * gate.unsqueeze(-1)  # (B, T, num_heads, 1) broadcast
         y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
-
-
-class SmearGate(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-
-    def forward(self, x: Tensor) -> Tensor:
-        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
-        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
-        return (1 - g) * x + g * x_prev
-
-
-class BigramHashEmbedding(nn.Module):
-    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
-        super().__init__()
-        self.bigram_vocab_size = bigram_vocab_size
-        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
-        nn.init.zeros_(self.embed.weight)
-        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
-        if self.proj is not None:
-            nn.init.zeros_(self.proj.weight)
-        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
-
-    def bigram_hash(self, tokens: Tensor) -> Tensor:
-        t = tokens.to(torch.int32)
-        mod = self.bigram_vocab_size - 1
-        out = torch.empty_like(t)
-        out[..., 0] = mod
-        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
-        return out.long()
-
-    def forward(self, token_ids: Tensor) -> Tensor:
-        h = self.embed(self.bigram_hash(token_ids))
-        if self.proj is not None:
-            h = self.proj(h)
-        return h * self.scale.to(dtype=h.dtype)
 
 
 class MLP(nn.Module):
@@ -596,12 +531,9 @@ class Block(nn.Module):
         rope_dims: int = 0,
         layer_idx: int = 0,
         ln_scale: bool = False,
-        attn_gate_dim: int = 12,
     ):
         super().__init__()
-        self.attn_norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims, attn_gate_dim=attn_gate_dim)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -612,9 +544,9 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         s = self.ln_scale_factor
-        attn_out = self.attn(self.attn_norm(x) * s)
+        attn_out = self.attn(norm(x) * s)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * s)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(norm(x) * s)
         return x
 
 
@@ -631,12 +563,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        bigram_vocab_size: int = 0,
-        bigram_dim: int = 128,
-        xsa_last_n: int = 0,
         rope_dims: int = 0,
         ln_scale: bool = False,
-        attn_gate_dim: int = 12,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -644,8 +572,6 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
-        self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -662,15 +588,10 @@ class GPT(nn.Module):
                     rope_dims=rope_dims,
                     layer_idx=i,
                     ln_scale=ln_scale,
-                    attn_gate_dim=attn_gate_dim,
                 )
                 for i in range(num_layers)
             ]
         )
-        self.final_norm = RMSNorm()
-        if xsa_last_n > 0:
-            for i in range(max(0, num_layers - xsa_last_n), num_layers):
-                self.blocks[i].attn.use_xsa = True
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -688,10 +609,7 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
-        if self.bigram is not None:
-            x = x + self.bigram(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x = self.smear(x)
+        x = norm(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -703,7 +621,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x)
+        x = norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         logits_proj = F.linear(x_flat, self.tok_emb.weight)
@@ -714,10 +632,7 @@ class GPT(nn.Module):
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
         x = self.tok_emb(input_ids)
-        if self.bigram is not None:
-            x = x + self.bigram(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x = self.smear(x)
+        x = norm(x)
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
@@ -727,7 +642,7 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
-        x = self.final_norm(x)
+        x = norm(x)
         logits_proj = F.linear(x, self.tok_emb.weight)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
@@ -1005,12 +920,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        bigram_vocab_size=args.bigram_vocab_size,
-        bigram_dim=args.bigram_dim,
-        xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
-        attn_gate_dim=args.attn_gate_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1035,17 +946,9 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    scalar_params.append(base_model.smear.gate)
-    if base_model.bigram is not None:
-        scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr
-    tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
-    if base_model.bigram is not None:
-        tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
-        if base_model.bigram.proj is not None:
-            matrix_params.append(base_model.bigram.proj.weight)
     optimizer_tok = torch.optim.AdamW(
-        tok_params,
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         weight_decay=args.adam_wd,
@@ -1297,11 +1200,8 @@ def main() -> None:
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
-        attn_gate_dim=args.attn_gate_dim,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
