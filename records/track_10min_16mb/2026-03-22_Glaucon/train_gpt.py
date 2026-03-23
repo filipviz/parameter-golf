@@ -1,6 +1,8 @@
 """
-train_gpt_submit.py — Submission v2: wider MLP + STE int6 QAT + MTP + seq2048 + NTK RoPE +
-fp16 embed + late-K passthrough + sliding window eval.
+Glaucon training script.
+
+Default profile: 11 layers with partial RoPE, LN scale, EMA, XSA4, gated attention,
+symmetric Muon scaling, and brotli compression for the 10-minute / 16 MB track.
 """
 
 from __future__ import annotations
@@ -33,11 +35,11 @@ from flash_attn_interface import flash_attn_func as flash_attn_3_func
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+# Default Glaucon run:
+# - 11 transformer blocks at width 512
+# - 8 attention heads with 4 KV heads (GQA), tied embeddings, gated attention
+# - partial RoPE, LN scale, EMA, XSA4, and symmetric Muon scaling
+# - 9000 iterations with a ~10 minute wallclock cap
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -54,8 +56,8 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    iterations = int(os.environ.get("ITERATIONS", 9000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -65,43 +67,36 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
-    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 22000.0))  # was 10k, NTK-scaled to ~22k at seq2048
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
-    embed_lr = float(os.environ.get("EMBED_LR", 0.6))
-    head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-10))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
-    mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 0))
-    mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.2))
-    muon_wd = float(os.environ.get("MUON_WD", 0.02))
-    adam_wd = float(os.environ.get("ADAM_WD", 0.01))
-    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
-    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
+    muon_wd = float(os.environ.get("MUON_WD", 0.045))
+    adam_wd = float(os.environ.get("ADAM_WD", 0.045))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
-    rope_dims = int(os.environ.get("ROPE_DIMS", 0))
-    ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
-    late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 16))
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
     attn_gate_dim = int(os.environ.get("ATTN_GATE_DIM", 12))
@@ -424,19 +419,9 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    _qat_enabled: bool = False
-
     def forward(self, x: Tensor) -> Tensor:
-        w = self.weight.to(x.dtype)
-        if CastedLinear._qat_enabled and self.training and w.ndim == 2:
-            with torch.no_grad():
-                w32 = self.weight.float()
-                row_max = w32.abs().amax(dim=1)
-                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
-            w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, w, bias)
+        return F.linear(x, self.weight.to(x.dtype), bias)
 
 
 
@@ -642,13 +627,10 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
-        tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        mtp_num_heads: int = 0,
-        mtp_loss_weight: float = 0.1,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
         xsa_last_n: int = 0,
@@ -659,11 +641,8 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.mtp_num_heads = mtp_num_heads
-        self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
@@ -689,22 +668,13 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
-        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
-        if self.lm_head is not None:
-            self.lm_head._zero_init = True
-        self.mtp_heads = nn.ModuleList(
-            [CastedLinear(model_dim, vocab_size, bias=False) for _ in range(mtp_num_heads)]
-        )
-        for head in self.mtp_heads:
-            head._zero_init = True
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
         self._init_weights()
 
     def _init_weights(self) -> None:
-        if self.tie_embeddings:
-            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         num_layers = len(self.blocks)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
@@ -736,32 +706,9 @@ class GPT(nn.Module):
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x_flat, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x_flat)
+        logits_proj = F.linear(x_flat, self.tok_emb.weight)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-
-        if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
-            _, seqlen, dim = x.shape
-            mtp_loss_sum = x.new_zeros(())
-            mtp_loss_count = 0
-            for k, mtp_head in enumerate(self.mtp_heads):
-                valid_t = seqlen - (k + 1)
-                if valid_t <= 0:
-                    continue
-                mtp_hidden = x[:, :valid_t, :].reshape(-1, dim)
-                mtp_targets = target_ids[:, k + 1 :].reshape(-1)
-                mtp_logits_proj = mtp_head(mtp_hidden)
-                mtp_logits = self.logit_softcap * torch.tanh(mtp_logits_proj / self.logit_softcap)
-                mtp_loss_sum = mtp_loss_sum + F.cross_entropy(mtp_logits.float(), mtp_targets, reduction="mean")
-                mtp_loss_count += 1
-            if mtp_loss_count > 0:
-                main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
-
         return main_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -781,10 +728,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
         x = self.final_norm(x)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            logits_proj = self.lm_head(x)
+        logits_proj = F.linear(x, self.tok_emb.weight)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
 
@@ -880,7 +824,7 @@ def eval_val_sliding(
 # -----------------------------
 
 def _classify_param(name: str) -> str:
-    if "tok_emb" in name or "lm_head" in name:
+    if "tok_emb" in name:
         return "embed"
     if ".mlp." in name:
         return "mlp"
@@ -1050,8 +994,6 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    CastedLinear._qat_enabled = args.qat_enabled
-
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1059,13 +1001,10 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        mtp_num_heads=args.mtp_num_heads,
-        mtp_loss_weight=args.mtp_loss_weight,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
@@ -1081,8 +1020,7 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR
-    # - untied lm_head (Adam) uses HEAD_LR
+    # - token embeddings use TIED_EMBED_LR via AdamW
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
@@ -1090,8 +1028,6 @@ def main() -> None:
         p for name, p in block_named_params
         if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.mtp_num_heads > 0:
-        matrix_params.extend([p for p in base_model.mtp_heads.parameters() if p.ndim == 2])
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1102,7 +1038,7 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
-    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    token_lr = args.tied_embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:
         tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
@@ -1132,25 +1068,14 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"model_params:{n_params}")
-    log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
+        f"tied_embeddings:True tied_embed_lr:{token_lr} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
@@ -1261,10 +1186,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        qat_threshold = float(os.environ.get("QAT_THRESHOLD", "0.1"))
-        if args.late_qat and scale < qat_threshold and not CastedLinear._qat_enabled:
-            CastedLinear._qat_enabled = True
-            log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1336,12 +1257,7 @@ def main() -> None:
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
 
-    full_state_dict = base_model.state_dict()
-    export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
-    excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
-    if excluded_mtp > 0:
-        log0(f"export_excluding_mtp_params:{excluded_mtp}")
-
+    export_sd = base_model.state_dict()
     if master_process:
         torch.save(export_sd, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
@@ -1378,10 +1294,9 @@ def main() -> None:
     eval_model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+        tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-        mtp_num_heads=0, mtp_loss_weight=0.0,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
