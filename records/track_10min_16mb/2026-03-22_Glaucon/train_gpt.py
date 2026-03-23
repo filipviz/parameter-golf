@@ -95,6 +95,8 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
 
+    quant_modes = os.environ.get("QUANT_MODES", "int6,int5_pct")
+
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
@@ -759,7 +761,55 @@ def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(t32 / scale.float()), -32, 31).to(torch.int8)
     return q, scale
 
-def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
+def quantize_intN_percentile(t: Tensor, bits: int,
+                              percentiles: tuple[float, ...] = (0.999, 0.9995, 0.9999, 0.99999, 1.0),
+                              ) -> tuple[Tensor, Tensor]:
+    """Per-row quantization with percentile scale search.
+
+    Tries multiple clip percentiles per row and picks the one minimizing
+    reconstruction MSE.  This is the "GPTQ-lite" approach from PR #535.
+    """
+    levels = 2 ** (bits - 1) - 1
+    t32 = t.float()
+    if t32.ndim != 2:
+        # Vectors / scalars: fall back to simple max-scale
+        amax = t32.abs().max().item()
+        scale = torch.tensor(amax / levels if amax > 0 else 1.0, dtype=torch.float16)
+        q = torch.clamp(torch.round(t32 / scale.float()), -levels - 1, levels).to(torch.int8)
+        return q, scale
+
+    rows, cols = t32.shape
+    best_q = torch.zeros(rows, cols, dtype=torch.int8)
+    best_scale = torch.zeros(rows, dtype=torch.float16)
+    best_mse = torch.full((rows,), float('inf'))
+
+    for p in percentiles:
+        if p >= 1.0:
+            clip_val = t32.abs().amax(dim=1)
+        else:
+            clip_val = torch.quantile(t32.abs(), p, dim=1)
+        clip_val = clip_val.clamp_min(1e-10)
+        s = (clip_val / levels).to(torch.float16)
+
+        t_clipped = t32.clamp(-clip_val[:, None], clip_val[:, None])
+        q = torch.clamp(torch.round(t_clipped / s.float()[:, None]), -levels - 1, levels).to(torch.int8)
+        deq = q.float() * s.float()[:, None]
+        row_mse = (t32 - deq).pow(2).mean(dim=1)
+
+        improved = row_mse < best_mse
+        best_q[improved] = q[improved]
+        best_scale[improved] = s[improved]
+        best_mse[improved] = row_mse[improved]
+
+    return best_q, best_scale
+
+def mixed_quantize(state_dict: dict[str, Tensor], quant_mode: str):
+    """Quantize a state dict according to the specified mode.
+
+    Modes:
+        "int6"     — baseline: int6 per-row (max scale) for MLP/attn, int8 for embed.
+        "int5_pct" — int5 + percentile scale search for MLP, int6 per-row for attn, int8 for embed.
+    """
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
@@ -773,21 +823,43 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             result[name] = t.float()
             meta[name] = "passthrough_ctrl"
             continue
-        # tok_emb.weight falls through to int8 via "embed" category
-        if cat in int6_cats and t.ndim >= 1:
-            q, s = quantize_int6_per_row(t)
-            result[name + ".q"] = q
-            result[name + ".scale"] = s
-            meta[name] = {"type": "int6"}
+
+        if quant_mode == "int5_pct":
+            # MLP matrices → int5 with percentile search
+            # Attn matrices → int6 per-row (baseline)
+            # Everything else → int8
+            if cat == "mlp" and t.ndim >= 1:
+                q, s = quantize_intN_percentile(t, bits=5)
+                result[name + ".q"] = q
+                result[name + ".scale"] = s
+                meta[name] = {"type": "int5"}
+            elif cat == "attn" and t.ndim >= 1:
+                q, s = quantize_int6_per_row(t)
+                result[name + ".q"] = q
+                result[name + ".scale"] = s
+                meta[name] = {"type": "int6"}
+            else:
+                q, s = quantize_float_tensor(t)
+                result[name + ".q"] = q
+                result[name + ".scale"] = s
+                meta[name] = {"type": "int8"}
         else:
-            q, s = quantize_float_tensor(t)
-            result[name + ".q"] = q
-            result[name + ".scale"] = s
-            meta[name] = {"type": "int8"}
+            # "int6" baseline: int6 for MLP/attn, int8 for embed
+            if cat in ("mlp", "attn") and t.ndim >= 1:
+                q, s = quantize_int6_per_row(t)
+                result[name + ".q"] = q
+                result[name + ".scale"] = s
+                meta[name] = {"type": "int6"}
+            else:
+                q, s = quantize_float_tensor(t)
+                result[name + ".q"] = q
+                result[name + ".scale"] = s
+                meta[name] = {"type": "int8"}
     return result, meta
 
-def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
-                          template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
+def dequantize_mixed(result: dict[str, Tensor], meta: dict[str, object],
+                     template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Dequantize a mixed-quantized state dict.  Handles int5, int6, and int8."""
     out: dict[str, Tensor] = {}
     for name, orig in template_sd.items():
         info = meta.get(name)
@@ -800,6 +872,7 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
                 t = t.to(orig_dtype)
             out[name] = t
             continue
+        # int5, int6, and int8 all dequantize identically: q * scale
         q, s = result[name + ".q"], result[name + ".scale"]
         if s.ndim > 0:
             out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
@@ -1169,31 +1242,8 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
 
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
-    quant_buf = io.BytesIO()
-    quant_payload = {"w": quant_result, "m": quant_meta}
-    torch.save(quant_payload, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = brotli.compress(quant_raw, quality=11)
-    if master_process:
-        with open("final_model.int6.ptz", "wb") as f:
-            f.write(quant_blob)
-        quant_file_bytes = len(quant_blob)
-        code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int6+brotli: {quant_file_bytes} bytes")
-        log0(f"Total submission size int6+brotli: {quant_file_bytes + code_bytes} bytes")
 
-    # Roundtrip: decompress + dequantize into fresh model + eval
-    if distributed:
-        dist.barrier()
-    with open("final_model.int6.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(
-        io.BytesIO(brotli.decompress(quant_blob_disk)),
-        map_location="cpu",
-    )
-    deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
-
+    # Build one eval model shell that we reload weights into for each quant mode.
     eval_model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
@@ -1207,58 +1257,90 @@ def main() -> None:
         if isinstance(m, CastedLinear):
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
-    eval_model.load_state_dict(deq_state, strict=True)
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
 
-    # Standard non-overlapping eval (sanity check)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args, compiled_eval, rank, world_size, device, grad_accum_steps,
-        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        eval_seq_len=effective_eval_seq_len,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-
-    # Sliding window eval (submission score)
+    quant_modes = [m.strip() for m in args.quant_modes.split(",") if m.strip()]
+    log0(f"quant_modes:{quant_modes}")
     sw_seq_len = effective_eval_seq_len
-    if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
-        torch.cuda.synchronize()
-        t_slide = time.perf_counter()
-        sw_val_loss, sw_val_bpb = eval_val_sliding(
-            args, eval_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride,
-            eval_seq_len=sw_seq_len,
-        )
-        torch.cuda.synchronize()
-        log0(
-            f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
-            f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
-        )
-        log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
-    # Second sliding window eval at stride=64 for submission comparison
-    if args.eval_stride != 64 and 64 < sw_seq_len:
+    for qm in quant_modes:
+        log0(f"\n{'='*60}")
+        log0(f"quant_export:{qm}")
+        log0(f"{'='*60}")
+
+        quant_result, quant_meta = mixed_quantize(sd_cpu, qm)
+        quant_buf = io.BytesIO()
+        torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+        quant_blob = brotli.compress(quant_buf.getvalue(), quality=11)
+        artifact_name = f"final_model.{qm}.ptz"
+        if master_process:
+            with open(artifact_name, "wb") as f:
+                f.write(quant_blob)
+            quant_file_bytes = len(quant_blob)
+            code_bytes = len(code.encode("utf-8"))
+            log0(f"Serialized model {qm}+brotli: {quant_file_bytes} bytes")
+            log0(f"Total submission size {qm}+brotli: {quant_file_bytes + code_bytes} bytes")
+
+        # Roundtrip: decompress + dequantize + load into eval model
+        if distributed:
+            dist.barrier()
+        with open(artifact_name, "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(
+            io.BytesIO(brotli.decompress(quant_blob_disk)),
+            map_location="cpu",
+        )
+        deq_state = dequantize_mixed(quant_state["w"], quant_state["m"], sd_cpu)
+        eval_model.load_state_dict(deq_state, strict=True)
+        compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
+
+        # Standard non-overlapping eval
         torch.cuda.synchronize()
-        t_slide64 = time.perf_counter()
-        sw64_val_loss, sw64_val_bpb = eval_val_sliding(
-            args, eval_model, rank, world_size, device,
+        t_qeval = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args, compiled_eval, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=64,
-            eval_seq_len=sw_seq_len,
+            eval_seq_len=effective_eval_seq_len,
         )
         torch.cuda.synchronize()
         log0(
-            f"final_int6_sliding_window_s64 val_loss:{sw64_val_loss:.4f} val_bpb:{sw64_val_bpb:.4f} "
-            f"stride:64 eval_time:{1000.0 * (time.perf_counter() - t_slide64):.0f}ms"
+            f"final_{qm}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
         )
-        log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+        log0(f"final_{qm}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+        # Sliding window eval (submission score)
+        if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+            torch.cuda.synchronize()
+            t_slide = time.perf_counter()
+            sw_val_loss, sw_val_bpb = eval_val_sliding(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride,
+                eval_seq_len=sw_seq_len,
+            )
+            torch.cuda.synchronize()
+            log0(
+                f"final_{qm}_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+                f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
+            )
+            log0(f"final_{qm}_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+
+        # Second sliding window eval at stride=64 for submission comparison
+        if args.eval_stride != 64 and 64 < sw_seq_len:
+            torch.cuda.synchronize()
+            t_slide64 = time.perf_counter()
+            sw64_val_loss, sw64_val_bpb = eval_val_sliding(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=64,
+                eval_seq_len=sw_seq_len,
+            )
+            torch.cuda.synchronize()
+            log0(
+                f"final_{qm}_sliding_window_s64 val_loss:{sw64_val_loss:.4f} val_bpb:{sw64_val_bpb:.4f} "
+                f"stride:64 eval_time:{1000.0 * (time.perf_counter() - t_slide64):.0f}ms"
+            )
+            log0(f"final_{qm}_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
