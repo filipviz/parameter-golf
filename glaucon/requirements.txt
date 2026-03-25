@@ -1,0 +1,10 @@
+# Hopper wheels published by PyTorch for FlashAttention 3.
+# The Linux H100 path should pick this up directly; non-Linux dev environments skip it.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch>=2.9
+numpy
+sentencepiece
+huggingface-hub
+brotli
+flash-attn-3==3.0.0 ; platform_system == "Linux"
