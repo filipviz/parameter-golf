@@ -42,9 +42,9 @@ Our philosophy is to beat other entrants by using rigorous, straightforward scie
 
 ## Current Frontier
 
-As of 2026-03-24, the official upstream leaderboard frontier is PR #549 at 1.1194 BPB (`LeakyReLU^2 + Legal Score-First TTT + Parallel Muon`), and it has already been merged into `upstream/main`. Because new records must improve by at least 0.005 nats, the next real record needs to be about 1.1122 BPB or lower, not merely anything below 1.1194.
+As of 2026-03-25, the official upstream leaderboard frontier is PR #549 at 1.1194 BPB (`LeakyReLU^2 + Legal Score-First TTT + Parallel Muon`), and it has already been merged into `upstream/main`. Because new records must improve by at least 0.005 nats of BPB, the next record needs to achieve 1.1144 BPB or lower.
 
-Among open upstream PRs, the strongest plausible 10min/16MB claim is PR #609 at 1.1154 BPB, but it is not yet a valid new record: it does not clear the 0.005-nat threshold relative to 1.1194, and OpenAI has already questioned whether its GPTQ calibration is illegally using training data during evaluation. Other serious open claims I checked, PR #606 (1.1162), PR #615 (1.1169), and PR #626 (1.1180), also fail the required improvement threshold. PR #628 reports 1.0983, but it is explicitly a non-record unlimited-compute run and should not be treated as the leaderboard frontier.
+Among open upstream PRs, the strongest current 10min/16MB contender is PR #728 at 1.1142 BPB (`Val-Calibrated GPTQ + XSA-all + BigramHash 3072x112`), which at least clears that threshold on paper.
 
 PRs progressively build on top of one another, so it can be helpful to take a look at the full lineage. A full report on the lineage of PR #549 is available in `research/lineage.md`.
 
