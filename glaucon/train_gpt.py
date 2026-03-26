@@ -37,7 +37,7 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     seq_len = int(os.environ.get("SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 2.0))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -334,7 +334,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,mlp_scale,resid_mix,q_gain,skip_weights,smear,ve_layer_scales,ve_shared.scale",
+        "attn_scale,mlp_scale,resid_mix,q_gain,smear,ve_layer_scales",
     ).split(",")
     if pattern
 )
@@ -547,12 +547,11 @@ class ValueEmbedding(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, ve_dim)
         self.proj = CastedLinear(ve_dim, kv_dim) if ve_dim != kv_dim else None
-        self.scale = nn.Parameter(torch.empty(()))
     def forward(self, token_ids: Tensor) -> Tensor:
         h = self.embed(token_ids)
         if self.proj is not None:
             h = self.proj(h)
-        return h * self.scale.to(dtype=h.dtype)
+        return h
 
 def mlp(x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
     return F.linear(F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5).square(), down_w.to(x.dtype))
@@ -610,10 +609,6 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.empty(self.num_skip_weights, model_dim))
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
         mlp_dim = int(mlp_mult * model_dim)
@@ -644,8 +639,6 @@ class GPT(nn.Module):
         device = self.tok_emb.weight.device
         # Embedding
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self._embed_init_std)
-        # Skip weights
-        self.skip_weights.data.fill_(1.0)
         # Smear gate
         self.smear.gate.data.zero_()
         # Bigram
@@ -655,7 +648,6 @@ class GPT(nn.Module):
         # Value embedding
         if self.ve_shared is not None:
             nn.init.normal_(self.ve_shared.embed.weight, std=0.01)
-            self.ve_shared.scale.data.fill_(0.1)
         for s in self.ve_layer_scales:
             s.data.fill_(1.0)
         # Per-block params and rotary buffers
@@ -663,9 +655,9 @@ class GPT(nn.Module):
         inv_freq = 1.0 / (self._rope_base ** (torch.arange(0, rd, 2, device=device, dtype=torch.float32) / rd))
         for block in self.blocks:
             block.attn.q_gain.data.fill_(self._qk_gain_init)
-            block.attn_scale.data.fill_(1.0)
-            block.mlp_scale.data.fill_(1.0)
-            block.resid_mix.data[0].fill_(1.0)
+            block.attn_scale.data.fill_(0.3)
+            block.mlp_scale.data.fill_(0.3)
+            block.resid_mix.data[0].fill_(0.4)
             block.resid_mix.data[1].zero_()
             block.attn.rotary.inv_freq.copy_(inv_freq)
         # Parameter banks
@@ -694,8 +686,7 @@ class GPT(nn.Module):
         x = self.smear(x)
         x0 = x
         ve_base: Tensor | None = None
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
+        for i in range(n):
             v_embed = None
             if self.ve_shared is not None and i in self.ve_layer_indices:
                 if ve_base is None:
@@ -704,20 +695,6 @@ class GPT(nn.Module):
             x = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=v_embed)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            v_embed = None
-            if self.ve_shared is not None and bi in self.ve_layer_indices:
-                if ve_base is None:
-                    ve_base = self.ve_shared(input_ids)
-                v_embed = ve_base * self.ve_layer_scales[self.ve_layer_indices.index(bi)].to(dtype=ve_base.dtype)
-            x = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=v_embed)
         return norm(x)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1216,8 +1193,6 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
@@ -1230,7 +1205,6 @@ def main() -> None:
         tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": args.embed_lr, "base_lr": args.embed_lr})
         if base_model.ve_shared.proj is not None:
             scalar_params.append(base_model.ve_shared.proj.weight)
-        scalar_params.append(base_model.ve_shared.scale)
         for s in base_model.ve_layer_scales:
             scalar_params.append(s)
     optimizer_tok = torch.optim.AdamW(
