@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
+from utils import log_param_table
 
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -1162,7 +1163,8 @@ def main() -> None:
     logfile = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
-        logfile = f"logs/{args.run_id}.txt"
+        timestamp = time.strftime("%m%d_%H%M")
+        logfile = f"logs/{timestamp}_{args.run_id}.log"
         print(logfile)
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
@@ -1172,15 +1174,9 @@ def main() -> None:
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
-    log0(code, console=False)
-    log0("=" * 100, console=False)
-    log0(f"Running Python {sys.version}", console=False)
-    log0(f"Running PyTorch {torch.__version__}", console=False)
-    log0(
-        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
-        console=False,
-    )
-    log0("=" * 100, console=False)
+    # log0(code, console=False)
+    log0(f"python:{sys.version.split()[0]} torch:{torch.__version__}", console=False)
+    # log0(subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout, console=False)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1198,7 +1194,7 @@ def main() -> None:
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
-    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1:_}")
     base_model = _build_model(args, device)
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
@@ -1266,20 +1262,17 @@ def main() -> None:
         replicated_params.extend(pg["params"])
     replicated_params.extend(scalar_params)
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    log_param_table(base_model, log0)
     n_params = sum(p.numel() for p in base_model.parameters())
-    log0(f"model_params:{n_params}")
+    log0(f"model_params:{n_params:_}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(
-        f"embed_lr:{args.embed_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        f"train_batch_tokens:{args.train_batch_tokens} seq_len:{args.seq_len} "
-        f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
-        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
-    )
+    log0(f"embed_lr:{args.embed_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
+    log0(f"train_batch_tokens:{args.train_batch_tokens:_} seq_len:{args.seq_len} "
+         f"iterations:{args.iterations:_} warmup_steps:{args.warmup_steps} "
+         f"max_wallclock_seconds:{args.max_wallclock_seconds:.0f}")
     log0(f"seed:{args.seed}")
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     def zero_grad_all() -> None:
@@ -1396,9 +1389,12 @@ def main() -> None:
         )
         if should_log_train:
             gn = f" local_grad_norm:{grad_norm.item():.4f}" if grad_norm is not None else ""
+            step_ms = approx_training_time_ms / step
+            tok_per_sec = args.train_batch_tokens / (step_ms / 1000)
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f}{gn} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"lr_scale:{scale:.4f} tok/s:{tok_per_sec:_.0f} "
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{step_ms:.2f}ms"
             )
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
@@ -1408,7 +1404,7 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
     log0(
-        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024:_} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
     # Apply EMA weight averaging
@@ -1432,8 +1428,8 @@ def main() -> None:
         torch.save(export_sd, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model: {model_bytes} bytes")
-        log0(f"Code size: {code_bytes} bytes")
+        log0(f"Serialized model: {model_bytes:_} bytes")
+        log0(f"Code size: {code_bytes:_} bytes")
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
@@ -1447,8 +1443,8 @@ def main() -> None:
             f.write(quant_blob)
         quant_file_bytes = len(quant_blob)
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int6+brotli: {quant_file_bytes} bytes")
-        log0(f"Total submission size int6+brotli: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Serialized model int6+brotli: {quant_file_bytes:_} bytes")
+        log0(f"Total submission size int6+brotli: {quant_file_bytes + code_bytes:_} bytes")
     if distributed:
         dist.barrier()
     with open("final_model.int6.ptz", "rb") as f:
