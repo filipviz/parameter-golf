@@ -542,10 +542,10 @@ class BigramHashEmbedding(nn.Module):
 
 class ValueEmbedding(nn.Module):
     """Reinject token identity into attention values at specific layers."""
-    def __init__(self, vocab_size: int, ve_dim: int, model_dim: int):
+    def __init__(self, vocab_size: int, ve_dim: int, kv_dim: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, ve_dim)
-        self.proj = CastedLinear(ve_dim, model_dim) if ve_dim != model_dim else None
+        self.proj = CastedLinear(ve_dim, kv_dim) if ve_dim != kv_dim else None
         self.scale = nn.Parameter(torch.empty(()))
     def forward(self, token_ids: Tensor) -> Tensor:
         h = self.embed(token_ids)
@@ -692,27 +692,32 @@ class GPT(nn.Module):
         x = norm(x)
         x = self.smear(x)
         x0 = x
-        # Precompute per-layer value embeddings
-        ve = {}
-        if self.ve_shared is not None:
-            ve_base = self.ve_shared(input_ids)
-            for idx, layer_idx in enumerate(self.ve_layer_indices):
-                ve[layer_idx] = ve_base * self.ve_layer_scales[idx].to(dtype=ve_base.dtype)
+        ve_base: Tensor | None = None
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
+            v_embed = None
+            if self.ve_shared is not None and i in self.ve_layer_indices:
+                if ve_base is None:
+                    ve_base = self.ve_shared(input_ids)
+                v_embed = ve_base * self.ve_layer_scales[self.ve_layer_indices.index(i)].to(dtype=ve_base.dtype)
             x = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve.get(i))
+                v_embed=v_embed)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            v_embed = None
+            if self.ve_shared is not None and bi in self.ve_layer_indices:
+                if ve_base is None:
+                    ve_base = self.ve_shared(input_ids)
+                v_embed = ve_base * self.ve_layer_scales[self.ve_layer_indices.index(bi)].to(dtype=ve_base.dtype)
             x = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve.get(bi))
+                v_embed=v_embed)
         return norm(x)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
