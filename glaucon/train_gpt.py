@@ -1063,13 +1063,13 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         cat = _classify_param(name)
-        if not t.is_floating_point() or t.numel() <= 65536:
-            result[name] = t.to(torch.float16) if t.is_floating_point() else t
-            meta[name] = "passthrough"
-            continue
         if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
             result[name] = t.float()
             meta[name] = "passthrough_ctrl"
+            continue
+        if not t.is_floating_point() or t.numel() <= 65536:
+            result[name] = t.to(torch.float16) if t.is_floating_point() else t
+            meta[name] = "passthrough"
             continue
         if cat in int6_cats and t.ndim >= 1:
             q, s = quantize_int6_per_row(t)
@@ -1159,11 +1159,6 @@ def main() -> None:
     master_process = rank == 0
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-    enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
     logfile = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
@@ -1276,7 +1271,6 @@ def main() -> None:
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"embed_lr:{args.embed_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
@@ -1376,8 +1370,7 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm) if args.grad_clip_norm > 0 else None
         # === 3-phase overlapped optimizer step ===
         # Phase 1: Launch async reduce-scatter for banks (biggest first)
         optimizer_muon.launch_reduce_scatters()
@@ -1402,8 +1395,9 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            gn = f" local_grad_norm:{grad_norm.item():.4f}" if grad_norm is not None else ""
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f}{gn} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
