@@ -122,9 +122,7 @@ class Muon(torch.optim.Optimizer):
 
     def _build(self):
         self._distributed = dist.is_available() and dist.is_initialized()
-        self._world_size = dist.get_world_size() if self._distributed else 1
-        self._rank = dist.get_rank() if self._distributed else 0
-        ws = self._world_size
+        ws = dist.get_world_size() if self._distributed else 1
 
         self._bank_meta = []
         for group in self.param_groups:
@@ -276,8 +274,7 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
-    if usable <= 0:
-        raise ValueError(f"Validation split is too short for seq_len={seq_len}")
+    assert usable > 0, f"Validation split is too short for seq_len={seq_len}"
     return tokens[: usable + 1]
 def eval_val(
     args: Hyperparameters,
@@ -293,12 +290,7 @@ def eval_val(
 ) -> tuple[float, float]:
     seq_len = args.seq_len
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, seq_len={seq_len}"
-        )
+    assert local_batch_tokens >= seq_len, f"VAL_BATCH_SIZE too small for world_size={world_size}, seq_len={seq_len}"
     local_batch_seqs = local_batch_tokens // seq_len
     total_seqs = (val_tokens.numel() - 1) // seq_len
     seq_start = (total_seqs * rank) // world_size
@@ -414,6 +406,7 @@ class DistributedTokenLoader:
         self.stream = TokenStream(pattern)
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        assert local_tokens % seq_len == 0, f"local_tokens={local_tokens} not divisible by seq_len={seq_len}"
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
         start = self.rank * per_rank_span
@@ -477,15 +470,14 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) ->
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_dims: int = 0):
         super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError("model_dim must be divisible by num_heads")
-        if num_heads % num_kv_heads != 0:
-            raise ValueError("num_heads must be divisible by num_kv_heads")
+        assert dim % num_heads == 0, f"model_dim={dim} must be divisible by num_heads={num_heads}"
+        assert num_heads % num_kv_heads == 0, f"num_heads={num_heads} must be divisible by num_kv_heads={num_kv_heads}"
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        if self.head_dim % 2 != 0:
-            raise ValueError("head_dim must be even for RoPE")
+        assert self.head_dim % 2 == 0, f"head_dim={self.head_dim} must be even for RoPE"
+        assert rope_dims <= self.head_dim, f"rope_dims={rope_dims} must be <= head_dim={self.head_dim}"
+        assert rope_dims % 2 == 0, f"rope_dims={rope_dims} must be even"
         self.q_gain = nn.Parameter(torch.empty(num_heads))
         self.rope_dims = rope_dims if rope_dims > 0 else self.head_dim
         self.rotary = Rotary(self.head_dim, rope_dims=rope_dims)
@@ -605,8 +597,7 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
     ):
         super().__init__()
-        if logit_softcap <= 0.0:
-            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        assert logit_softcap > 0.0, f"logit_softcap must be positive, got {logit_softcap}"
         self.logit_softcap = logit_softcap
         # Store config for _init_weights (called after to_empty, not during __init__)
         self._embed_init_std = embed_init_std
@@ -692,14 +683,6 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, CastedLinear):
                 nn.init.orthogonal_(module.weight, gain=1.0)
-    def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
-        if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
-            return None
-        if ve_cache is not None and 've' not in ve_cache:
-            ve_cache['ve'] = self.ve_shared(input_ids)
-        ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
-        ve_idx = self.ve_layer_indices.index(layer_idx)
-        return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
     def _encode(self, input_ids: Tensor) -> Tensor:
         """Shared encoder body for forward and forward_logits."""
         n = self.num_layers
@@ -709,24 +692,27 @@ class GPT(nn.Module):
         x = norm(x)
         x = self.smear(x)
         x0 = x
+        # Precompute per-layer value embeddings
+        ve = {}
+        if self.ve_shared is not None:
+            ve_base = self.ve_shared(input_ids)
+            for idx, layer_idx in enumerate(self.ve_layer_indices):
+                ve[layer_idx] = ve_base * self.ve_layer_scales[idx].to(dtype=ve_base.dtype)
         skips: list[Tensor] = []
-        ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
             x = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve)
+                v_embed=ve.get(i))
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
             x = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve)
+                v_embed=ve.get(bi))
         return norm(x)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
@@ -1155,14 +1141,11 @@ def main() -> None:
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if world_size <= 0:
-        raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+    assert world_size > 0, f"WORLD_SIZE must be positive, got {world_size}"
+    assert 8 % world_size == 0, f"WORLD_SIZE={world_size} must divide 8"
     grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required")
+    assert torch.cuda.is_available(), "CUDA is required"
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
@@ -1202,13 +1185,11 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
+    assert args.tokenizer_path.endswith(".model"), f"Expected SentencePiece .model file: {args.tokenizer_path}"
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
-        raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
-        )
+    assert int(sp.vocab_size()) == args.vocab_size, (
+        f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+    )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.seq_len)
