@@ -66,7 +66,7 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 1536))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
@@ -74,11 +74,10 @@ class Hyperparameters:
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
-    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
@@ -853,30 +852,13 @@ def eval_val_sliding_ttt(
 
     log0(f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
          f"total_windows={len(window_starts)} stride={stride} "
-         f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} "
-         f"freeze_blocks={args.ttt_freeze_blocks}")
+         f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs}")
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    # Freeze first N blocks
-    frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
-    ttt_params = []
-    for name, p in base_model.named_parameters():
-        freeze = False
-        for bi in frozen_block_ids:
-            if f"blocks.{bi}." in name:
-                freeze = True
-                break
-        if freeze:
-            p.requires_grad_(False)
-        else:
-            p.requires_grad_(True)
-            ttt_params.append(p)
-
-    log0(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
-         f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
+    ttt_params = list(base_model.parameters())
 
     optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
     t0 = time.perf_counter()
@@ -973,8 +955,6 @@ def eval_val_sliding_ttt(
     val_loss = (loss_sum / token_count).item()
     val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
 
-    for p in base_model.parameters():
-        p.requires_grad_(True)
     base_model.eval()
 
     log0(f"ttt_sliding:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
