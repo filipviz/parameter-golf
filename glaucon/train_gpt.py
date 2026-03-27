@@ -48,6 +48,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
+    mlp_dim_override = os.environ.get("MLP_DIM", None)
     rope_base = float(os.environ.get("ROPE_BASE", 22082.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.035))
@@ -355,7 +356,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,mlp_scale,resid_mix,q_gain,smear,ve_layer_scales",
+        "attn_scale,mlp_scale,resid_mix,q_gain,skip_weights,smear,ve_layer_scales",
     ).split(",")
     if pattern
 )
@@ -616,6 +617,7 @@ class GPT(nn.Module):
         ve_enabled: bool = False,
         ve_dim: int = 128,
         ve_layers: str = "9,10",
+        mlp_dim_override: int | None = None,
     ):
         super().__init__()
         assert logit_softcap > 0.0, f"logit_softcap must be positive, got {logit_softcap}"
@@ -630,9 +632,13 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = nn.Parameter(torch.empty(self.num_skip_weights, model_dim))
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
-        mlp_dim = int(mlp_mult * model_dim)
+        mlp_dim = mlp_dim_override if mlp_dim_override is not None else int(mlp_mult * model_dim)
         self.num_layers = num_layers
         self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
@@ -660,6 +666,8 @@ class GPT(nn.Module):
         device = self.tok_emb.weight.device
         # Embedding
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self._embed_init_std)
+        # Skip weights
+        self.skip_weights.data.fill_(1.0)
         # Smear gate
         self.smear.gate.data.zero_()
         # Bigram
@@ -707,7 +715,8 @@ class GPT(nn.Module):
         x = self.smear(x)
         x0 = x
         ve_base: Tensor | None = None
-        for i in range(n):
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
             v_embed = None
             if self.ve_shared is not None and i in self.ve_layer_indices:
                 if ve_base is None:
@@ -716,6 +725,20 @@ class GPT(nn.Module):
             x = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                v_embed=v_embed)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            bi = self.num_encoder_layers + i
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            v_embed = None
+            if self.ve_shared is not None and bi in self.ve_layer_indices:
+                if ve_base is None:
+                    ve_base = self.ve_shared(input_ids)
+                v_embed = ve_base * self.ve_layer_scales[self.ve_layer_indices.index(bi)].to(dtype=ve_base.dtype)
+            x = self.blocks[bi](x, x0,
+                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
+                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=v_embed)
         return norm(x)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1113,6 +1136,7 @@ def _build_model(args: Hyperparameters, device: torch.device) -> GPT:
             num_heads=args.num_heads,
             num_kv_heads=args.num_kv_heads,
             mlp_mult=args.mlp_mult,
+            mlp_dim_override=int(args.mlp_dim_override) if args.mlp_dim_override is not None else None,
             embed_init_std=args.embed_init_std,
             logit_softcap=args.logit_softcap,
             rope_base=args.rope_base,
@@ -1212,6 +1236,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
