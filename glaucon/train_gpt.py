@@ -80,6 +80,7 @@ class Hyperparameters:
 
 # --- Batched Newton-Schulz orthogonalization ---
 
+@torch.compile(dynamic=False, fullgraph=True)
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
     """Batched Newton-Schulz orthogonalization. G: (B,M,N) or (M,N)."""
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -135,6 +136,7 @@ class Muon(torch.optim.Optimizer):
                 dev = p.device
                 self._bank_meta.append({
                     'p': p,
+                    'mantissa': torch.zeros(B, *tail, device=dev, dtype=torch.uint16),
                     'B': B,
                     'padded_grad': torch.zeros(padded_B, *tail, device=dev, dtype=torch.bfloat16),
                     'shard': torch.zeros(shard_B, *tail, device=dev, dtype=torch.bfloat16),
@@ -145,6 +147,24 @@ class Muon(torch.optim.Optimizer):
         # Sort by size descending -- launch biggest reduce-scatters first
         self._bank_meta.sort(key=lambda m: -m['p'].numel())
         self._built = True
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _wd_and_update_inplace(p, mantissa, grad, wd_tensor, lr_tensor):
+        """Weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors.
+        Mantissa is tracked to enable higher precision updates on bfloat16 parameters.
+        bfloat16 format: 1 sign bit + 8 exponent bits + 7 mantissa bits = 16 bits total
+        float32 format: 1 sign bit + 8 exponent bits + 23 mantissa bits = 32 bits total
+        """
+        assert p.dtype == mantissa.dtype == torch.uint16
+        grad = grad.float()
+        wd_factor = wd_tensor.to(torch.float32)
+        lr_factor = lr_tensor.to(torch.float32)
+        p_precise_raw = (p.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
+        p_precise = p_precise_raw.view(torch.float32)
+        p_precise.copy_(p_precise - (p_precise * wd_factor * lr_factor) - (grad * lr_factor))
+        p.copy_((p_precise_raw >> 16).to(torch.uint16))
+        mantissa.copy_(p_precise_raw.to(torch.uint16))
 
     def launch_reduce_scatters(self):
         """Phase 1: launch async reduce-scatter for all banks. Call right after backward."""
@@ -182,6 +202,8 @@ class Muon(torch.optim.Optimizer):
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
             wd = group.get("weight_decay", 0.0)
+            wd_t = torch.tensor(wd, dtype=torch.float32)
+            lr_t = torch.tensor(lr, dtype=torch.float32)
 
             prev_ag_handle = None
             prev_m = None
@@ -195,11 +217,9 @@ class Muon(torch.optim.Optimizer):
 
                 if prev_ag_handle is not None:
                     prev_ag_handle.wait()
-                    pp = prev_m['p']
-                    upd = prev_m['full_update'][:prev_m['B']]
-                    if wd > 0.0:
-                        pp.data.mul_(1.0 - lr * wd)
-                    pp.add_(upd.to(dtype=pp.dtype), alpha=-lr * prev_m['scale'])
+                    self._wd_and_update_inplace(
+                        prev_m['p'].view(torch.uint16), prev_m['mantissa'],
+                        prev_m['full_update'][:prev_m['B']] * prev_m['scale'], wd_t, lr_t)
 
                 if sharded and self._rs_futures[i] is not None:
                     self._rs_futures[i].wait()
@@ -225,17 +245,15 @@ class Muon(torch.optim.Optimizer):
                         m['full_update'], update, async_op=True)
                     prev_m = m
                 else:
-                    if wd > 0.0:
-                        p.data.mul_(1.0 - lr * wd)
-                    p.add_(update.to(dtype=p.dtype), alpha=-lr * m['scale'])
+                    self._wd_and_update_inplace(
+                        p.view(torch.uint16), m['mantissa'],
+                        update * m['scale'], wd_t, lr_t)
 
             if prev_ag_handle is not None:
                 prev_ag_handle.wait()
-                pp = prev_m['p']
-                upd = prev_m['full_update'][:prev_m['B']]
-                if wd > 0.0:
-                    pp.data.mul_(1.0 - lr * wd)
-                pp.add_(upd.to(dtype=pp.dtype), alpha=-lr * prev_m['scale'])
+                self._wd_and_update_inplace(
+                    prev_m['p'].view(torch.uint16), prev_m['mantissa'],
+                    prev_m['full_update'][:prev_m['B']] * prev_m['scale'], wd_t, lr_t)
 
             if hasattr(self, '_rs_futures'):
                 del self._rs_futures
@@ -494,9 +512,9 @@ class CausalSelfAttention(nn.Module):
         return (y_g - proj).reshape(B, T, H, D)
     def forward(self, x: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, v_embed: Tensor | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = F.linear(x, q_w.to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        k = F.linear(x, k_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = F.linear(x, v_w.to(x.dtype))
+        q = F.linear(x, q_w).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = F.linear(x, k_w).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = F.linear(x, v_w)
         if v_embed is not None:
             v = v + v_embed
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -510,7 +528,7 @@ class CausalSelfAttention(nn.Module):
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
-        return F.linear(y, out_w.to(x.dtype))
+        return F.linear(y, out_w)
 
 class SmearGate(nn.Module):
     def __init__(self, dim: int):
@@ -554,7 +572,7 @@ class ValueEmbedding(nn.Module):
         return h
 
 def mlp(x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
-    return F.linear(F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5).square(), down_w.to(x.dtype))
+    return F.linear(F.leaky_relu(F.linear(x, up_w), negative_slope=0.5).square(), down_w)
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
@@ -1108,9 +1126,7 @@ def _build_model(args: Hyperparameters, device: torch.device) -> GPT:
     model = model.to_empty(device=device)
     model._init_weights()
     model.bfloat16()
-    # Banks and CastedLinear stay FP32, cast to BF16 in forward
-    for bank in (model.qo_bank, model.kv_bank, model.mlp_up_bank, model.mlp_down_bank):
-        bank.data = bank.data.float()
+    # Banks stay bf16; Muon tracks mantissa for fp32-precise updates
     for m in model.modules():
         if isinstance(m, CastedLinear):
             m.float()
@@ -1287,6 +1303,8 @@ def main() -> None:
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
+        for m in optimizer_muon._bank_meta:
+            m['mantissa'].zero_()
         zero_grad_all()
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
