@@ -19,7 +19,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
+from triton_kernels import FusedLinearReLUSquareFunction
 from utils import log_param_table
+
+# Fused triton kernel: relu(x @ W1.T)^2 @ W2, by @andrewbriand, @jrauvola
+ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
 
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -80,7 +84,6 @@ class Hyperparameters:
 
 # --- Batched Newton-Schulz orthogonalization ---
 
-@torch.compile(dynamic=False, fullgraph=True)
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
     """Batched Newton-Schulz orthogonalization. G: (B,M,N) or (M,N)."""
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -572,7 +575,7 @@ class ValueEmbedding(nn.Module):
         return h
 
 def mlp(x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
-    return F.linear(F.leaky_relu(F.linear(x, up_w), negative_slope=0.5).square(), down_w)
+    return ReLUSqrdMLP(x, up_w, down_w)
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
@@ -634,7 +637,7 @@ class GPT(nn.Module):
         self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
-        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads,
                   layer_idx=i, ln_scale=ln_scale, rope_dims=rope_dims)
