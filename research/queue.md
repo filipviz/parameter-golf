@@ -1,11 +1,10 @@
 First, a run with the current implementation to see where things are performance-wise.
 
-1. Revert the value embedding cleanup 9ba6376b97dee81e8a46a633e542af17190ec77e to see if this yields a speedup.
-2. Experiment with `d_vocab`, non-tied embeddings, and vocab quantization. The `embedding`/`lm_head` matrix is an unusually small component of our overall parameter count. On one hand, this may be desireable given that `d_model` is so small. But this seems under-explored in general. I'm currently training an sp2048 tokenizer.
-3. Label smoothing.
-4. WSD lr schedule.
-5. Batch sizes. The repo baseline used `524_288`, and a number of runs used `786_432`.
-6. Grad norm clipping. First, the existing implementation is technically buggy - we clip before we all-reduce. That said, the difference is marginal in practice, and a proper implementation would be slightly tricky. I'm more interested in using a higher grad clip norm, or using other techniques to stabilize early training.
+1. Experimenting with `d_vocab`, non-tied embeddings, and vocab quantization. The `embedding`/`lm_head` matrix is an unusually small component of our overall parameter count. On one hand, this may be desireable given that `d_model` is so small. But this seems under-explored in general. I trained an sp2048 tokenizer, and we can experiment with that, the current sp1024 with untied embeddings/lm_head, and also leaving it in bf16 instead of quantizing to int8.
+2. Label smoothing.
+3. WSD lr schedule.
+4. Batch sizes. The repo baseline used `524_288`, and a number of runs used `786_432`.
+5. Grad norm clipping. First, the existing implementation is technically buggy - we clip before we all-reduce. That said, the difference is marginal in practice, and a proper implementation would be slightly tricky. I'm more interested in using a higher grad clip norm, or using other techniques to stabilize early training.
 
 Re-introduce a few small tweaks:
 - AdamW eps=1e-10

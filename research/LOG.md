@@ -128,3 +128,4 @@ GQA brings us comfortably under 16MB (1.2MB headroom) and is 3.5% faster, but sw
 At this point:
 1. I noticed that several defaults didn't align with the PR's run command and fixed these. Specifically, I moved bigram vocab size from 2048 -> 1536, enabled TTT, and removed TTT freezing.
 2. I re-introduced u-net skip connections to the codebase.
+3. Reverting the value embedding cleanup `9ba6376b97dee81e8a46a633e542af17190ec77e` yielded a small speedup.
