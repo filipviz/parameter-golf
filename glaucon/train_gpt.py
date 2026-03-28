@@ -70,10 +70,16 @@ class Hyperparameters:
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
-    ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
+    # "static" = data-independent causal routing matrix (ablation)
+    # "full" = full AttnRes with learned queries: a_{c,s} ∝ exp(w_c · RMSNorm(y_s))
+    attn_res_mode = os.environ.get("ATTN_RES_MODE", "static")
+    attn_res_lr = float(os.environ.get("ATTN_RES_LR", 0.10))
+    # "sublayer" = each attn and mlp is a separate residual (2L+1 sources)
+    # "block" = attn+mlp combined into one residual per block (L+1 sources)
+    attn_res_granularity = os.environ.get("ATTN_RES_GRANULARITY", "block")
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
@@ -355,7 +361,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,mlp_scale,resid_mix,q_gain,skip_weights,smear,ve_layer_scales",
+        "q_gain,smear,ve_layer_scales",
     ).split(",")
     if pattern
 )
@@ -553,25 +559,6 @@ class ValueEmbedding(nn.Module):
 def mlp(x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
     return ReLUSqrdMLP(x, up_w, down_w)
 
-class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
-                 layer_idx: int = 0, ln_scale: bool = False, rope_dims: int = 0):
-        super().__init__()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_dims=rope_dims)
-        self.attn_scale = nn.Parameter(torch.empty(dim))
-        self.mlp_scale = nn.Parameter(torch.empty(dim))
-        self.resid_mix = nn.Parameter(torch.empty(2, dim))
-        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
-    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor,
-                out_w: Tensor, up_w: Tensor, down_w: Tensor,
-                cos: Tensor, sin: Tensor, v_embed: Tensor | None = None) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, cos, sin, v_embed=v_embed)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp(norm(x_out) * self.ln_scale_factor, up_w, down_w)
-        return x_out
-
 class GPT(nn.Module):
     def __init__(
         self,
@@ -589,16 +576,19 @@ class GPT(nn.Module):
         bigram_dim: int = 128,
         xsa_last_n: int = 0,
         rope_dims: int = 0,
-        ln_scale: bool = False,
         ve_enabled: bool = False,
         ve_dim: int = 128,
         ve_layers: str = "9,10",
         mlp_dim_override: int | None = None,
         seq_len: int = 2048,
+        attn_res_mode: str = "static",
+        attn_res_granularity: str = "block",
     ):
         super().__init__()
         assert logit_softcap > 0.0, f"logit_softcap must be positive, got {logit_softcap}"
         self.logit_softcap = logit_softcap
+        self.attn_res_mode = attn_res_mode
+        self.attn_res_granularity = attn_res_granularity
         # Store config for _init_weights (called after to_empty, not during __init__)
         self._embed_init_std = embed_init_std
         self._qk_gain_init = qk_gain_init
@@ -609,10 +599,6 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.empty(self.num_skip_weights, model_dim))
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
         mlp_dim = mlp_dim_override if mlp_dim_override is not None else int(mlp_mult * model_dim)
@@ -621,11 +607,22 @@ class GPT(nn.Module):
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
         self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
-        self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads,
-                  layer_idx=i, ln_scale=ln_scale, rope_dims=rope_dims)
-            for i in range(num_layers)
+        self.attns = nn.ModuleList([
+            CausalSelfAttention(model_dim, num_heads, num_kv_heads, rope_dims=rope_dims)
+            for _ in range(num_layers)
         ])
+        # Attention Residuals: inter-layer routing
+        # "sublayer": 2L+1 sources (embed + attn_out + mlp_out per block)
+        # "block": L+1 sources (embed + one y per block)
+        N = (2 * num_layers + 1) if attn_res_granularity == "sublayer" else (num_layers + 1)
+        if attn_res_mode == "static":
+            # Data-independent causal routing matrix (ablation)
+            self.attn_res_logits = nn.Parameter(torch.zeros(N, N))
+            self.register_buffer("attn_res_mask",
+                torch.triu(torch.ones(N, N, dtype=torch.bool), diagonal=1), persistent=False)
+        elif attn_res_mode == "full":
+            # Full AttnRes: a_{c,s} ∝ exp(w_c · RMSNorm(y_s))
+            self.attn_res_queries = nn.Parameter(torch.zeros(N, model_dim))
         self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
         if self.ve_layer_indices:
             self.ve_shared = ValueEmbedding(vocab_size, ve_dim, kv_dim)
@@ -637,7 +634,7 @@ class GPT(nn.Module):
             self.ve_layer_scales = nn.ParameterList()
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
-                self.blocks[i].attn.use_xsa = True
+                self.attns[i].use_xsa = True
         # Precomputed RoPE buffers (fixed seq_len, no caching needed)
         rd = rope_dims if rope_dims > 0 else (model_dim // num_heads)
         self.register_buffer("rope_cos", torch.empty(1, seq_len, 1, rd // 2), persistent=False)
@@ -647,8 +644,6 @@ class GPT(nn.Module):
         device = self.tok_emb.weight.device
         # Embedding
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self._embed_init_std)
-        # Skip weights
-        self.skip_weights.data.fill_(1.0)
         # Smear gate
         self.smear.gate.data.zero_()
         # Bigram
@@ -660,6 +655,13 @@ class GPT(nn.Module):
             nn.init.normal_(self.ve_shared.embed.weight, std=0.01)
         for s in self.ve_layer_scales:
             s.data.fill_(1.0)
+        # Attention Residuals — zero init for both modes
+        # Static: zero logits → uniform softmax → equal-weight sum (= standard residual)
+        # Full: zero queries → w·RMSNorm(y)=0 for all sources → uniform softmax (= standard residual)
+        if self.attn_res_mode == "static":
+            self.attn_res_logits.data.zero_()
+        elif self.attn_res_mode == "full":
+            self.attn_res_queries.data.zero_()
         # RoPE buffers
         rd = self._rope_dims if self._rope_dims > 0 else self._head_dim
         inv_freq = 1.0 / (self._rope_base ** (torch.arange(0, rd, 2, device=device, dtype=torch.float32) / rd))
@@ -667,13 +669,9 @@ class GPT(nn.Module):
         freqs = torch.outer(t, inv_freq)
         self.rope_cos.copy_(freqs.cos()[None, :, None, :])
         self.rope_sin.copy_(freqs.sin()[None, :, None, :])
-        # Per-block params
-        for block in self.blocks:
-            block.attn.q_gain.data.fill_(self._qk_gain_init)
-            block.attn_scale.data.fill_(0.3)
-            block.mlp_scale.data.fill_(0.3)
-            block.resid_mix.data[0].fill_(0.4)
-            block.resid_mix.data[1].zero_()
+        # Per-layer attention params
+        for attn in self.attns:
+            attn.q_gain.data.fill_(self._qk_gain_init)
         # Parameter banks
         n = self.num_layers
         proj_scale = 1.0 / math.sqrt(2 * n)
@@ -690,6 +688,22 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, CastedLinear):
                 nn.init.orthogonal_(module.weight, gain=1.0)
+    def _weighted_sum_static(self, weights: Tensor, row: int, ys: list[Tensor]) -> Tensor:
+        """Weighted combination of ys[0..row] using pre-computed static weights."""
+        x = weights[row, 0] * ys[0]
+        for s in range(1, row + 1):
+            x = x + weights[row, s] * ys[s]
+        return x
+
+    def _weighted_sum_full(self, q: Tensor, ys: list[Tensor]) -> Tensor:
+        """Weighted combination with learned query and per-token routing."""
+        logits = torch.stack([(q * norm(ys[s])).sum(dim=-1) for s in range(len(ys))], dim=0)
+        w = F.softmax(logits, dim=0)  # (num_sources, B, T)
+        x = w[0].unsqueeze(-1) * ys[0]
+        for s in range(1, len(ys)):
+            x = x + w[s].unsqueeze(-1) * ys[s]
+        return x
+
     def _encode(self, input_ids: Tensor) -> Tensor:
         """Shared encoder body for forward and forward_logits."""
         n = self.num_layers
@@ -698,7 +712,6 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = norm(x)
         x = self.smear(x)
-        x0 = x
         # Precompute per-layer value embeddings
         ve = {}
         if self.ve_shared is not None:
@@ -707,22 +720,57 @@ class GPT(nn.Module):
                 ve[layer_idx] = ve_base * self.ve_layer_scales[idx].to(dtype=ve_base.dtype)
         cos = self.rope_cos.to(dtype=x.dtype)
         sin = self.rope_sin.to(dtype=x.dtype)
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                cos, sin, v_embed=ve.get(i))
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                cos, sin, v_embed=ve.get(bi))
-        return norm(x)
+        ys: list[Tensor] = [x]  # ys[0] = y_0 = embedding output
+        if self.attn_res_granularity == "sublayer":
+            # Sublayer-level: each attn and mlp produces a separate residual output
+            # Consumer row 2*i → attn input, row 2*i+1 → mlp input, row 2*L → final
+            if self.attn_res_mode == "static":
+                weights = F.softmax(self.attn_res_logits.masked_fill(self.attn_res_mask, float('-inf')), dim=-1)
+                for i in range(n):
+                    h_attn = self._weighted_sum_static(weights, 2 * i, ys)
+                    y_attn = self.attns[i](norm(h_attn),
+                        self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                        self.qo_bank[n + i], cos, sin, v_embed=ve.get(i))
+                    ys.append(y_attn)
+                    h_mlp = self._weighted_sum_static(weights, 2 * i + 1, ys)
+                    y_mlp = mlp(norm(h_mlp), self.mlp_up_bank[i], self.mlp_down_bank[i])
+                    ys.append(y_mlp)
+                out = self._weighted_sum_static(weights, 2 * n, ys)
+            elif self.attn_res_mode == "full":
+                for i in range(n):
+                    h_attn = self._weighted_sum_full(self.attn_res_queries[2 * i], ys)
+                    y_attn = self.attns[i](norm(h_attn),
+                        self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                        self.qo_bank[n + i], cos, sin, v_embed=ve.get(i))
+                    ys.append(y_attn)
+                    h_mlp = self._weighted_sum_full(self.attn_res_queries[2 * i + 1], ys)
+                    y_mlp = mlp(norm(h_mlp), self.mlp_up_bank[i], self.mlp_down_bank[i])
+                    ys.append(y_mlp)
+                out = self._weighted_sum_full(self.attn_res_queries[2 * n], ys)
+        else:
+            # Block-level: y_t = f_t(h_t) with internal attn→MLP residual
+            # f_t(h) = let a = attn(norm(h)); mlp(norm(h + a))
+            # Consumer row i → block i input, row L → final output
+            if self.attn_res_mode == "static":
+                weights = F.softmax(self.attn_res_logits.masked_fill(self.attn_res_mask, float('-inf')), dim=-1)
+                for i in range(n):
+                    h = self._weighted_sum_static(weights, i, ys)
+                    attn_out = self.attns[i](norm(h),
+                        self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                        self.qo_bank[n + i], cos, sin, v_embed=ve.get(i))
+                    y = mlp(norm(h + attn_out), self.mlp_up_bank[i], self.mlp_down_bank[i])
+                    ys.append(y)
+                out = self._weighted_sum_static(weights, n, ys)
+            elif self.attn_res_mode == "full":
+                for i in range(n):
+                    h = self._weighted_sum_full(self.attn_res_queries[i], ys)
+                    attn_out = self.attns[i](norm(h),
+                        self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                        self.qo_bank[n + i], cos, sin, v_embed=ve.get(i))
+                    y = mlp(norm(h + attn_out), self.mlp_up_bank[i], self.mlp_down_bank[i])
+                    ys.append(y)
+                out = self._weighted_sum_full(self.attn_res_queries[n], ys)
+        return norm(out)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
         logits_proj = F.linear(x.reshape(-1, x.size(-1)), self.tok_emb.weight)
@@ -950,9 +998,9 @@ def eval_val_sliding_ttt(
 def _classify_param(name: str) -> str:
     if "tok_emb" in name:
         return "embed"
-    if ".mlp." in name:
+    if "mlp." in name:
         return "mlp"
-    if ".attn." in name or (".proj." in name and ".mlp." not in name):
+    if "attn" in name or ("proj." in name and "mlp." not in name):
         return "attn"
     return "other"
 def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
@@ -983,18 +1031,18 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tens
     for name, tensor in sd.items():
         if name == "qo_bank":
             for i in range(n):
-                out[f"blocks.{i}.attn.c_q.weight"] = tensor[i]
-                out[f"blocks.{i}.attn.proj.weight"] = tensor[n + i]
+                out[f"attns.{i}.c_q.weight"] = tensor[i]
+                out[f"attns.{i}.proj.weight"] = tensor[n + i]
         elif name == "kv_bank":
             for i in range(n):
-                out[f"blocks.{i}.attn.c_k.weight"] = tensor[i]
-                out[f"blocks.{i}.attn.c_v.weight"] = tensor[n + i]
+                out[f"attns.{i}.c_k.weight"] = tensor[i]
+                out[f"attns.{i}.c_v.weight"] = tensor[n + i]
         elif name == "mlp_up_bank":
             for i in range(n):
-                out[f"blocks.{i}.mlp.fc.weight"] = tensor[i]
+                out[f"mlp.{i}.fc.weight"] = tensor[i]
         elif name == "mlp_down_bank":
             for i in range(n):
-                out[f"blocks.{i}.mlp.proj.weight"] = tensor[i]
+                out[f"mlp.{i}.proj.weight"] = tensor[i]
         else:
             out[name] = tensor
     return out
@@ -1009,27 +1057,27 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
     down_slices = [None] * n
     consumed = set()
     for i in range(n):
-        qk = f"blocks.{i}.attn.c_q.weight"
+        qk = f"attns.{i}.c_q.weight"
         if qk in sd:
             qo_slices[i] = sd[qk]
             consumed.add(qk)
-        ok = f"blocks.{i}.attn.proj.weight"
+        ok = f"attns.{i}.proj.weight"
         if ok in sd:
             qo_slices[n + i] = sd[ok]
             consumed.add(ok)
-        kk = f"blocks.{i}.attn.c_k.weight"
+        kk = f"attns.{i}.c_k.weight"
         if kk in sd:
             kv_slices[i] = sd[kk]
             consumed.add(kk)
-        vk = f"blocks.{i}.attn.c_v.weight"
+        vk = f"attns.{i}.c_v.weight"
         if vk in sd:
             kv_slices[n + i] = sd[vk]
             consumed.add(vk)
-        fk = f"blocks.{i}.mlp.fc.weight"
+        fk = f"mlp.{i}.fc.weight"
         if fk in sd:
             up_slices[i] = sd[fk]
             consumed.add(fk)
-        dk = f"blocks.{i}.mlp.proj.weight"
+        dk = f"mlp.{i}.proj.weight"
         if dk in sd:
             down_slices[i] = sd[dk]
             consumed.add(dk)
@@ -1108,11 +1156,12 @@ def _build_model(args: Hyperparameters, device: torch.device) -> GPT:
             bigram_dim=args.bigram_dim,
             xsa_last_n=args.xsa_last_n,
             rope_dims=args.rope_dims,
-            ln_scale=args.ln_scale,
             ve_enabled=args.ve_enabled,
             ve_dim=args.ve_dim,
             ve_layers=args.ve_layers,
             seq_len=args.seq_len,
+            attn_res_mode=args.attn_res_mode,
+            attn_res_granularity=args.attn_res_granularity,
         )
     model = model.to_empty(device=device)
     model._init_weights()
@@ -1194,14 +1243,12 @@ def main() -> None:
         base_model.qo_bank, base_model.kv_bank,
         base_model.mlp_up_bank, base_model.mlp_down_bank,
     ]
-    block_named_params = list(base_model.blocks.named_parameters())
+    attn_named_params = list(base_model.attns.named_parameters())
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in attn_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
@@ -1216,6 +1263,12 @@ def main() -> None:
             scalar_params.append(base_model.ve_shared.proj.weight)
         for s in base_model.ve_layer_scales:
             scalar_params.append(s)
+    # Attention Residual routing params — separate group with its own LR
+    attn_res_params = []
+    if hasattr(base_model, 'attn_res_logits'):
+        attn_res_params.append(base_model.attn_res_logits)
+    if hasattr(base_model, 'attn_res_queries'):
+        attn_res_params.append(base_model.attn_res_queries)
     optimizer_tok = torch.optim.AdamW(
         tok_params,
         betas=(args.beta1, args.beta2),
@@ -1232,27 +1285,34 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    scalar_groups = [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}]
+    if attn_res_params:
+        scalar_groups.append({"params": attn_res_params, "lr": args.attn_res_lr, "base_lr": args.attn_res_lr})
     optimizer_scalar = torch.optim.AdamW(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        scalar_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
-        weight_decay=args.adam_wd,
+        weight_decay=0.0,  # no weight decay on routing params; scalar WD set per-group below
         fused=True,
     )
+    # Set weight decay only on the scalar group, not the attn_res group
+    optimizer_scalar.param_groups[0]["weight_decay"] = args.adam_wd
     # Non-bank params that need manual all-reduce (replicated across GPUs)
     replicated_params = list(optimizer_tok.param_groups[0]["params"])
     for pg in optimizer_tok.param_groups[1:]:
         replicated_params.extend(pg["params"])
     replicated_params.extend(scalar_params)
+    replicated_params.extend(attn_res_params)
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     log_param_table(base_model, log0)
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params:_}")
-    xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
+    xsa_layers = [i for i, a in enumerate(base_model.attns) if a.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(f"embed_lr:{args.embed_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
+    log0(f"embed_lr:{args.embed_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} attn_res_lr:{args.attn_res_lr}")
+    log0(f"attn_res_mode:{args.attn_res_mode} attn_res_granularity:{args.attn_res_granularity}")
     log0(f"train_batch_tokens:{args.train_batch_tokens:_} seq_len:{args.seq_len} "
          f"iterations:{args.iterations:_} warmup_steps:{args.warmup_steps} "
          f"max_wallclock_seconds:{args.max_wallclock_seconds:.0f}")
@@ -1392,6 +1452,12 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024:_} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    # TEMPORARY: exit early before evaluation for proxy runs
+    if os.environ.get("EARLY_EXIT", ""):
+        log0("EARLY_EXIT: skipping evaluation")
+        if distributed:
+            dist.destroy_process_group()
+        return
     # Apply EMA weight averaging
     log0("ema:applying EMA weights")
     current_state = base_model.state_dict()
