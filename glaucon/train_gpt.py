@@ -455,29 +455,6 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
 
-class Rotary(nn.Module):
-    def __init__(self, dim: int, rope_dims: int = 0):
-        super().__init__()
-        rd = rope_dims if rope_dims > 0 else dim
-        self.register_buffer("inv_freq", torch.empty(rd // 2), persistent=False)
-        self._seq_len_cached = 0
-        self._cos_cached: Tensor | None = None
-        self._sin_cached: Tensor | None = None
-    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        if (
-            self._cos_cached is None
-            or self._sin_cached is None
-            or self._seq_len_cached != seq_len
-            or self._cos_cached.device != device
-        ):
-            inv_freq = self.inv_freq.to(device)
-            t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
-            freqs = torch.outer(t, inv_freq)
-            self._cos_cached = freqs.cos()[None, :, None, :]
-            self._sin_cached = freqs.sin()[None, :, None, :]
-            self._seq_len_cached = seq_len
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
-
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) -> Tensor:
     if rope_dims > 0 and rope_dims < x.size(-1):
         x_rope, x_pass = x[..., :rope_dims], x[..., rope_dims:]
@@ -502,7 +479,6 @@ class CausalSelfAttention(nn.Module):
         assert rope_dims % 2 == 0, f"rope_dims={rope_dims} must be even"
         self.q_gain = nn.Parameter(torch.empty(num_heads))
         self.rope_dims = rope_dims if rope_dims > 0 else self.head_dim
-        self.rotary = Rotary(self.head_dim, rope_dims=rope_dims)
         self.use_xsa = False  # set by GPT.__init__ for deep layers only
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         """Efficient XSA: subtract self-value projection via GQA-aware reshape."""
@@ -513,7 +489,8 @@ class CausalSelfAttention(nn.Module):
         vn = F.normalize(v, dim=-1).unsqueeze(-2)
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
-    def forward(self, x: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, v_embed: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor,
+                cos: Tensor, sin: Tensor, v_embed: Tensor | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = F.linear(x, q_w).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = F.linear(x, k_w).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -523,9 +500,8 @@ class CausalSelfAttention(nn.Module):
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = norm(q)
         k = norm(k)
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin, self.rope_dims)
-        k = apply_rotary_emb(k, cos, sin, self.rope_dims)
+        q = apply_rotary_emb(q, cos[:, :seqlen], sin[:, :seqlen], self.rope_dims)
+        k = apply_rotary_emb(k, cos[:, :seqlen], sin[:, :seqlen], self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
         y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
@@ -587,10 +563,11 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(torch.empty(2, dim))
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor,
-                out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None) -> Tensor:
+                out_w: Tensor, up_w: Tensor, down_w: Tensor,
+                cos: Tensor, sin: Tensor, v_embed: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed)
+        attn_out = self.attn(norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, cos, sin, v_embed=v_embed)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp(norm(x_out) * self.ln_scale_factor, up_w, down_w)
         return x_out
@@ -617,6 +594,7 @@ class GPT(nn.Module):
         ve_dim: int = 128,
         ve_layers: str = "9,10",
         mlp_dim_override: int | None = None,
+        seq_len: int = 2048,
     ):
         super().__init__()
         assert logit_softcap > 0.0, f"logit_softcap must be positive, got {logit_softcap}"
@@ -660,6 +638,10 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        # Precomputed RoPE buffers (fixed seq_len, no caching needed)
+        rd = rope_dims if rope_dims > 0 else (model_dim // num_heads)
+        self.register_buffer("rope_cos", torch.empty(1, seq_len, 1, rd // 2), persistent=False)
+        self.register_buffer("rope_sin", torch.empty(1, seq_len, 1, rd // 2), persistent=False)
     def _init_weights(self) -> None:
         """Initialize all parameter values. Called after to_empty(), not during __init__."""
         device = self.tok_emb.weight.device
@@ -678,16 +660,20 @@ class GPT(nn.Module):
             nn.init.normal_(self.ve_shared.embed.weight, std=0.01)
         for s in self.ve_layer_scales:
             s.data.fill_(1.0)
-        # Per-block params and rotary buffers
+        # RoPE buffers
         rd = self._rope_dims if self._rope_dims > 0 else self._head_dim
         inv_freq = 1.0 / (self._rope_base ** (torch.arange(0, rd, 2, device=device, dtype=torch.float32) / rd))
+        t = torch.arange(self.rope_cos.size(1), device=device, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        self.rope_cos.copy_(freqs.cos()[None, :, None, :])
+        self.rope_sin.copy_(freqs.sin()[None, :, None, :])
+        # Per-block params
         for block in self.blocks:
             block.attn.q_gain.data.fill_(self._qk_gain_init)
             block.attn_scale.data.fill_(0.3)
             block.mlp_scale.data.fill_(0.3)
             block.resid_mix.data[0].fill_(0.4)
             block.resid_mix.data[1].zero_()
-            block.attn.rotary.inv_freq.copy_(inv_freq)
         # Parameter banks
         n = self.num_layers
         proj_scale = 1.0 / math.sqrt(2 * n)
@@ -719,12 +705,14 @@ class GPT(nn.Module):
             ve_base = self.ve_shared(input_ids)
             for idx, layer_idx in enumerate(self.ve_layer_indices):
                 ve[layer_idx] = ve_base * self.ve_layer_scales[idx].to(dtype=ve_base.dtype)
+        cos = self.rope_cos.to(dtype=x.dtype)
+        sin = self.rope_sin.to(dtype=x.dtype)
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve.get(i))
+                cos, sin, v_embed=ve.get(i))
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -733,7 +721,7 @@ class GPT(nn.Module):
             x = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve.get(bi))
+                cos, sin, v_embed=ve.get(bi))
         return norm(x)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
@@ -1124,6 +1112,7 @@ def _build_model(args: Hyperparameters, device: torch.device) -> GPT:
             ve_enabled=args.ve_enabled,
             ve_dim=args.ve_dim,
             ve_layers=args.ve_layers,
+            seq_len=args.seq_len,
         )
     model = model.to_empty(device=device)
     model._init_weights()
