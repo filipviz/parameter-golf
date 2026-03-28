@@ -1,17 +1,18 @@
+First, a run with the current implementation to see where things are performance-wise.
+
 1. Revert the value embedding cleanup 9ba6376b97dee81e8a46a633e542af17190ec77e to see if this yields a speedup.
 2. Experiment with `d_vocab`, non-tied embeddings, and vocab quantization. The `embedding`/`lm_head` matrix is an unusually small component of our overall parameter count. On one hand, this may be desireable given that `d_model` is so small. But this seems under-explored in general. I'm currently training an sp2048 tokenizer.
-3. WSD lr schedule.
-4. Batch sizes. The repo baseline used `524_288`, and a number of runs used `786_432`.
-5. Higher grad clipping.
+3. Label smoothing.
+4. WSD lr schedule.
+5. Batch sizes. The repo baseline used `524_288`, and a number of runs used `786_432`.
+6. Grad norm clipping. First, the existing implementation is technically buggy - we clip before we all-reduce. That said, the difference is marginal in practice, and a proper implementation would be slightly tricky. I'm more interested in using a higher grad clip norm, or using other techniques to stabilize early training.
 
-A few small tweaks:
+Re-introduce a few small tweaks:
 - AdamW eps=1e-10
 - symmetric muon aspect ratio scaling for kv bank.
 - per-head gated attention
 
-
 Start by reading AGENTS.md and glaucon/train_gpt.py to get your bearing. We're currently on an 8xH100 instance and the goal is to do some performance engineering, incorporating some techniques to see if they provide a speedup. We can use short (~1000 step) runs, profiling, and benchmarking to speed up our iteration cycle here.
-
 
 1. One possible piece of low-hanging fruit is replacing the mutable rotary cache with fixed buffers (since sequence length is the same at train and test time). Want to give that a shot?
 2. I remember seeing some test which showed a speedup from cudagraph marking the beginning of the step, but I'm not sure if that applies for us since we're using the default compile mode. Could you help me think through this?
@@ -20,6 +21,7 @@ Start by reading AGENTS.md and glaucon/train_gpt.py to get your bearing. We're c
 5. Compiling the NS iterations and AdamW step.
 6. expandable_segments
 
+The thing I'm really interested in is replacing the u-net skip connections, `resid_mix`, and MLP/attention scales with something like [Attention Residuals](https://arxiv.org/abs/2603.15031). I could see fixed learned scalars working well, but we should also try the learned query approach from the paper.
 
 ## What didn't work
 

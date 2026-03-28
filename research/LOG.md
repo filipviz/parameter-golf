@@ -2,7 +2,6 @@
 
 ## Cleanup
 
-
 Starting point: PR #549 (record, 1.1194 BPB) copied into `glaucon/train_gpt.py` in commit `1e2934b14f2e6bf4dea755374272190d597a28c4`. PR #549's implementation and logs are available in `records/track_10min_16mb/2026-03-23_LeakyReLU_LegalTTT_ParallelMuon`. These changes go through commit `a2f177e0b69be89124d0de108053d12604cab9b1`.
 
 - Removed features which were disabled in the record: DTG, gated attention, value residual, LAWA, MTP, standalone int8 quantization pipeline, unused compressor fallback imports.
