@@ -9,24 +9,81 @@ of all previous outputs: `h_t = sum_s a_{t,s} * y_s`.
 
 Reference: Su et al., "Attention Residuals" (arXiv:2603.15031)
 
-## What we implemented
+## Current implementation: Paper-faithful Block AttnRes
 
-Two modes behind `ATTN_RES_MODE`:
+We implement the paper's **Block AttnRes** variant: sublayer-level routing over
+block-compressed sources. Each sublayer (attention or MLP) has its own learned
+query vector that routes over completed block representations plus the current
+intra-block partial sum.
 
-- **`static`**: Data-independent causal routing matrix. An `(N, N)` lower-triangular
-  logit matrix, softmaxed row-wise. Each row gives the weights a consumer uses to
-  combine all preceding y's. This is a simpler ablation — not from the paper itself.
+### Configuration
 
-- **`full`**: The paper's AttnRes mechanism. Learned query vectors `w_c` per consumer,
-  with `a_{c,s} = exp(w_c . RMSNorm(y_s))`, softmaxed over sources. Per-token routing.
+Single env var: `ATTN_RES_BLOCK_SIZE` (default: 4)
 
-Two granularity levels behind `ATTN_RES_GRANULARITY`:
+Block size is measured in sublayers (each transformer layer has 2: attn + MLP).
+So `ATTN_RES_BLOCK_SIZE=4` means 2 transformer layers per compression block.
 
-- **`block`** (recommended): One residual output per block. The block function has an
-  internal attn→MLP residual: `y = mlp(norm(h + attn(norm(h))))`. Matrix is `(L+1, L+1)`.
+With L=11 transformer layers (22 sublayers):
+- `BLOCK_SIZE=4`: 5 full blocks + 1 partial (1 layer) + embedding = ~7 sources max
+- `BLOCK_SIZE=6`: 3 full blocks + 1 partial (2 layers) + embedding = ~5 sources max
+- `BLOCK_SIZE=8`: 2 full blocks + 1 partial (3 layers) + embedding = ~4 sources max
+- `BLOCK_SIZE=22`: 1 partial block (all layers) + embedding = 2 sources
 
-- **`sublayer`**: Each attn and MLP sublayer produces a separate residual output.
-  Matrix is `(2L+1, 2L+1)`. Mathematically closer to the paper but ~40% slower.
+The paper uses ~8 blocks for a 48-layer MoE model. Smaller block sizes give finer
+routing granularity but more sources to attend over.
+
+### Architecture
+
+Parameters: `attn_res_queries` of shape `(2L+1, model_dim)` — one query per sublayer
+consumer (attn + MLP per layer) plus a final output query. Stored in fp32 (via
+`CONTROL_TENSOR_NAME_PATTERNS`), cast to bf16 in the forward pass.
+
+Forward loop (pseudocode):
+```python
+blocks = []           # completed block representations
+partial = embedding   # running intra-block sum
+
+for i in range(num_layers):
+    # --- Attention sublayer ---
+    h = block_attn_res(blocks, partial, queries[2*i])
+    if i % layers_per_block == 0:       # block boundary
+        blocks.append(partial)
+        partial = None
+    attn_out = attn_i(norm(h))
+    partial = (partial + attn_out) if partial is not None else attn_out
+
+    # --- MLP sublayer ---
+    h = block_attn_res(blocks, partial, queries[2*i + 1])
+    mlp_out = mlp_i(norm(h))
+    partial = partial + mlp_out
+
+out = block_attn_res(blocks, partial, queries[2*L])
+return norm(out)
+```
+
+Key properties:
+- **Embedding is isolated**: boundary fires at layer 0, so embedding is always its
+  own block. The paper notes the model assigns substantial attention to embedding.
+- **h is freshly routed each sublayer**: no residual accumulates on h.
+- **Sublayer outputs accumulate on partial**: traditional residual within blocks.
+- **partial is an attnres source**: the MLP can attend to the current partial (which
+  includes the attn output), preserving the attn→MLP information path without a
+  hardcoded skip connection. This is key — see "Internal residual" below.
+- **Uneven last block is fine**: just stays as a smaller partial block.
+
+### Routing function (`_block_attn_res`)
+
+```python
+sources = blocks + [partial]             # list of [B, T, D]
+V = torch.stack(sources)                 # [N, B, T, D]
+K = RMSNorm(V)                           # normalize keys
+q = query.to(bf16)                       # fp32 → bf16
+logits = (q * K).sum(dim=-1)             # [N, B, T]
+w = softmax(logits, dim=0).unsqueeze(-1) # [N, B, T, 1]
+return (w * V).sum(dim=0)                # [B, T, D]
+```
+
+This is the paper's formulation: `a_{c,s} ∝ exp(w_c · RMSNorm(y_s))`.
 
 ## What we removed
 
@@ -36,15 +93,17 @@ AttnRes subsumes several existing mechanisms:
 - `attn_scale` / `mlp_scale` (per-dim output gating)
 - `ln_scale` (1/sqrt(layer) normalization scaling)
 - `Block` class entirely — `GPT` now holds `attns` (ModuleList of CausalSelfAttention)
+- Static routing mode (`attn_res_logits`, causal mask) — superseded by learned queries
+- Sublayer granularity mode — superseded by paper-faithful block compression
 
 ## Implementation details
 
 ### torch.compile performance
 
-Benchmarked extensively on H100. Key finding: **explicit scalar*tensor accumulation
-loops compile 2x faster than stack+einsum** (2.87ms vs 6.37ms for the routing-only
-overhead). The compiler fuses the chain of scalar broadcast multiply + add ops into
-a single kernel.
+Benchmarked on H100. Key finding from earlier work: **explicit scalar*tensor
+accumulation loops compile 2x faster than stack+einsum** (2.87ms vs 6.37ms for
+routing-only overhead). The compiler fuses scalar broadcast multiply + add chains
+into a single kernel.
 
 ```python
 # Fast (compiles well):
@@ -57,34 +116,38 @@ stk = torch.stack(ys, dim=0)
 x_in = torch.einsum('s,sbtd->btd', weights[row, :len(ys)], stk)
 ```
 
-Other findings:
-- `softmax(dim=-1)` vs `softmax(dim=0)` via transpose: no meaningful difference
-- Reconstructing the causal mask each forward vs `register_buffer`: within noise;
-  we use `register_buffer` for cleaner code
-- `per-row softmax` (variable-length slices) triggers "online softmax disabled"
-  warning and is slightly slower
+**TODO**: The current `_block_attn_res` uses the stack+sum pattern for clarity.
+This needs benchmarking on H100 — if step time regresses, rewrite to use the
+Python-loop accumulation pattern (compute logits in a loop, then accumulate
+weighted values in a loop). The number of sources is small (≤~7 with default
+config) so either approach may be fine.
 
-### FP32 contamination bug (fixed)
+### FP32 query storage
 
-`CONTROL_TENSOR_NAME_PATTERNS` originally included `attn_res_logits` and
-`attn_res_queries`, causing `restore_low_dim_params_to_fp32` to keep them in fp32.
-This made the softmax weights fp32, which then upcasted every subsequent weighted
-sum operation to fp32 — cascading through the entire forward pass. Fixed by removing
-AttnRes params from the control tensor patterns.
+Queries are stored in fp32 via `CONTROL_TENSOR_NAME_PATTERNS` and cast to bf16
+in `_block_attn_res`. This helps optimizer stability without contaminating the
+forward pass with fp32 compute (the earlier fp32 contamination bug that cascaded
+through all weighted sums).
 
-### Internal residual is essential
+### Internal residual via partial block
 
-Without the internal `h + attn_out` residual inside the block function, the model
-barely learns (train_loss stuck at ~4.9 after 200 steps vs ~2.9 with it). The attn
-bottleneck is too narrow for all information to flow through.
+In the previous block-level implementation, we needed an explicit internal residual
+(`h + attn_out`) — without it, the model barely learned (stuck at ~4.9 loss). This
+was because the block-level routing gave the MLP no direct access to the attn output.
+
+In the paper-faithful implementation, this problem doesn't arise: the MLP sublayer
+routes over `blocks + [partial]`, and `partial` already contains the attn output
+(via `partial = partial + attn_out`). The MLP's query can attend to this partial
+to recover the attn→MLP information path. No hardcoded skip needed.
 
 ### Zero-init for standard residual equivalence
 
-Both modes zero-init their routing parameters:
-- `static`: zero logits → uniform softmax → equal-weight sum = standard residual
-- `full`: zero queries → `w . RMSNorm(y) = 0` → uniform softmax = standard residual
+Zero queries → `w · RMSNorm(y) = 0` for all sources → uniform softmax → equal-weight
+sum. At initialization, this is equivalent to standard residual connections.
 
-## Proxy run results (200 steps, 1xH100)
+## Historical proxy run results (200 steps, 1xH100)
+
+These used the old static/block implementation. Kept for reference.
 
 Baseline: standard residual with skip connections, resid_mix, attn/mlp scale, ln_scale.
 
@@ -96,31 +159,24 @@ Baseline: standard residual with skip connections, resid_mix, attn/mlp scale, ln
 | Block+intres static LR=1.0 | 3.26     | 2.93     | 1.7559      | 621ms    | 19806 MiB |
 | Sublayer static LR=0.5     | 3.26     | 2.92     | 1.7563      | 865ms    | 23173 MiB |
 
-**Block-level with internal residual at LR=1.0 is the sweet spot:**
-- 2.5% faster per step than baseline (621ms vs 637ms)
-- 1.9GB less peak memory (19.8 vs 21.7 GiB)
-- Loss slightly behind at 200 steps but routing is still converging
-- Sublayer gives identical loss but 40% slower — not worth it
+## Next steps
 
-## Proposed full-scale experiments
+### Proxy sweep on 1xH100 (200–500 steps)
 
-### Run 1: `attnres_block_static_lr100`
-```bash
-SEED=3 RUN_ID="attnres_block_static_lr100" ITERATIONS=500 WARMDOWN_ITERS=3500 \
-    ATTN_RES_MODE=static ATTN_RES_LR=1.0 ATTN_RES_GRANULARITY=block
-```
+Primary goal: verify step time is competitive with baseline (637ms target).
+Secondary goal: compare loss trajectories across block sizes.
 
-### Run 2: `attnres_block_static_lr050`
-```bash
-SEED=3 RUN_ID="attnres_block_static_lr050" ITERATIONS=500 WARMDOWN_ITERS=3500 \
-    ATTN_RES_MODE=static ATTN_RES_LR=0.5 ATTN_RES_GRANULARITY=block
-```
+Proposed runs:
+1. `ATTN_RES_BLOCK_SIZE=4  ATTN_RES_LR=0.1`  — default (2 layers/block, ~7 sources)
+2. `ATTN_RES_BLOCK_SIZE=8  ATTN_RES_LR=0.1`  — coarser (4 layers/block, ~4 sources)
+3. `ATTN_RES_BLOCK_SIZE=22 ATTN_RES_LR=0.1`  — single block (just embedding + partial)
 
-Compare final val_bpb against baseline's 1.4966.
+If step time regresses significantly, rewrite `_block_attn_res` to use the
+Python-loop accumulation pattern that we know compiles well.
 
-### Future directions (if promising)
-- Test `full` mode (learned queries) at block granularity — adds ~0.8ms overhead
-  but enables data-dependent routing
-- Try even higher routing LR (2.0, 5.0)
-- Experiment with different block internal structure (e.g., no internal residual
-  but with a learned gate)
+Also sweep `ATTN_RES_LR` — prior results suggest higher LR (0.5–1.0) helps routing
+converge faster, but that was with static mode. Full mode may behave differently.
+
+### Full-scale 8xH100
+
+Take the best 1–2 configs from the proxy sweep to full training.
