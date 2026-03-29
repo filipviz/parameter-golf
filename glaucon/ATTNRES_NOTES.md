@@ -183,16 +183,58 @@ Baseline: standard residual with skip connections, resid_mix, attn/mlp scale, ln
 | Block+intres static LR=1.0 | 3.26     | 2.93     | 1.7559      | 621ms    | 19806 MiB |
 | Sublayer static LR=0.5     | 3.26     | 2.92     | 1.7563      | 865ms    | 23173 MiB |
 
-## Current status
+## Current status (2026-03-29)
 
-Proxy sweep running (2026-03-29): 500-step runs on 1xH100 comparing BS=8, BS=4,
-BS=2 (all at ATTN_RES_LR=0.5) against the PR #549 baseline with no warmdown.
+### Where we are
 
-### Next steps
+Block-runner two-phase implementation is integrated into `train_gpt.py` and
+verified (numerical equivalence + gradcheck). Baseline 500-step proxy (PR #549,
+no warmdown) completed: **val_bpb=1.3925, step_avg=650ms**.
 
-1. Analyze proxy sweep results — compare loss trajectories and step times.
-2. If promising, take best config(s) to full 8xH100 training.
-3. Further performance optimization if needed:
-   - Fused triton kernel for inter-block phase (eliminate kernel launch overhead)
-   - Custom `torch.autograd.Function` to collapse routing into single autograd node
-   - Explore whether BS=8 (+12% overhead) is sufficient routing granularity
+### Next: LR sweep needed
+
+The `ATTN_RES_LR` value needs tuning. Previous runs used LR=0.5 with
+`WARMDOWN_ITERS=3500`, which meant the effective LR at step 1 was
+`0.5 * 500/3500 ≈ 0.07`. With warmdown now disabled for proxy runs, LR=0.5 may
+be too aggressive. Suggested sweep for BS=4:
+
+- `ATTN_RES_LR=0.5` (may be too high without warmdown)
+- `ATTN_RES_LR=0.1` (conservative, closer to effective LR from earlier runs)
+- `ATTN_RES_LR=0.25` (middle ground)
+
+Then take the best LR to BS=2 and BS=8 for block-size comparison.
+
+### Open questions / future work
+
+**Performance:**
+- BS=8 is +12% overhead (728ms vs 650ms), BS=4 is +24% (803ms). The remaining
+  gap is genuine routing compute (norm, matmul, softmax, weighted sum). A fused
+  triton kernel for `_inter_block_phase` could eliminate kernel launch overhead
+  between these ops. A custom `torch.autograd.Function` could also help by
+  collapsing routing into a single autograd node (fewer backward dispatch calls).
+- The record's removed techniques (skip connections, resid_mix, attn/mlp scale,
+  ln_scale) had near-zero overhead, so AttnRes should ideally match that. BS=8
+  is close but not there yet.
+
+**Correctness / training dynamics:**
+- Zero-init gives uniform routing (equal-weight average of all blocks), NOT
+  standard residual (which is an unnormalized sum). This is a known difference
+  from the paper. The model learns to adjust weights away from uniform, but
+  early training dynamics may differ.
+- The `ATTN_RES_LR` interacts with the main optimizer schedule. In full runs
+  with warmdown, the routing LR also decays. May want to consider whether the
+  routing queries should have their own independent schedule.
+
+**Scaling behavior:**
+- The paper used 48-layer MoE models where routing overhead is negligible
+  relative to per-layer compute. Our 11-layer dense model has proportionally
+  more routing overhead. The benefit of finer routing (more sources) needs to
+  outweigh the step-time cost.
+- Worth checking: does BS=4 or BS=2 actually improve BPB enough over BS=8 to
+  justify the extra compute? If BS=8 matches BS=4 on loss, it's the clear winner.
+
+**Files:**
+- `attnres_block_runner.py`: standalone functions + reference impl + tests
+- `test_attnres_block_runner.py`: correctness tests (numerical + gradcheck)
+- `profile_attnres.py`, `profile_fwd_detail.py`, `profile_fwd_detail2.py`,
+  `bench_attnres.py`: profiling scripts (can be cleaned up after experiments)
