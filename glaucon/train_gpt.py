@@ -671,30 +671,73 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, CastedLinear):
                 nn.init.orthogonal_(module.weight, gain=1.0)
-    def _block_attn_res(self, blocks: list[Tensor], partial: Tensor, q: Tensor) -> Tensor:
-        """AttnRes routing: attend over completed blocks + current partial block.
+    @staticmethod
+    def _inter_block_phase(
+        prev_blocks: Tensor, q_block: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Phase 1: batched inter-block attention for all sublayer queries.
 
-        blocks: list of completed block representations [B, T, D]
-        partial: current intra-block partial sum [B, T, D]
-        q: learned query vector [D] (fp32, cast to computation dtype here)
+        Args:
+            prev_blocks: [N, B, T, D] completed block representations
+            q_block:     [S, D] pseudo-queries for sublayers in this block
+        Returns:
+            num: [S, B, T, D] unnormalized weighted sum (max-shifted)
+            den: [S, B, T]    denominator
+            m:   [S, B, T]    max logit per query
         """
-        sources = blocks + [partial]
-        V = torch.stack(sources)       # [N, B, T, D]
-        K = norm(V)                    # RMSNorm on keys
-        q = q.to(dtype=K.dtype)
-        logits = (q * K).sum(dim=-1)   # [N, B, T]
-        w = F.softmax(logits, dim=0).unsqueeze(-1)  # [N, B, T, 1]
-        return (w * V).sum(dim=0)      # [B, T, D]
+        N, B, T, D = prev_blocks.shape
+        dtype = prev_blocks.dtype
+
+        # Scores via matmul: [N*B*T, D] @ [D, S] → reshape to [S, N, B, T]
+        K = norm(prev_blocks)
+        q = q_block.to(dtype)
+        scores = (K.reshape(-1, D) @ q.T).view(N, B, T, -1).permute(3, 0, 1, 2)
+
+        # Online softmax (exp/sum promote to fp32 under autocast — cast back)
+        m = scores.amax(dim=1).to(dtype)
+        w = torch.exp(scores - m.unsqueeze(1)).to(dtype)
+        den = w.sum(dim=1).to(dtype)
+
+        # Loop-based weighted sum over N (compiles into fused scalar*tensor chain)
+        num = w[:, 0, :, :].unsqueeze(-1) * prev_blocks[0].unsqueeze(0)
+        for ni in range(1, N):
+            num = num + w[:, ni, :, :].unsqueeze(-1) * prev_blocks[ni].unsqueeze(0)
+
+        return num, den, m
+
+    @staticmethod
+    def _merge_with_partial(
+        num1: Tensor, den1: Tensor, m1: Tensor,
+        partial: Tensor, q: Tensor,
+    ) -> Tensor:
+        """Phase 2: merge inter-block result with partial block via online softmax.
+
+        Args:
+            num1:    [B, T, D] inter-block unnormalized numerator
+            den1:    [B, T]    inter-block denominator
+            m1:      [B, T]    inter-block max logit
+            partial: [B, T, D] current intra-block partial sum
+            q:       [D]       query for this sublayer
+        Returns:
+            h: [B, T, D] routed hidden state
+        """
+        dtype = partial.dtype
+        z2 = norm(partial) @ q.to(dtype)
+        m = torch.maximum(m1, z2)
+        a = torch.exp(m1 - m).to(dtype)
+        b = torch.exp(z2 - m).to(dtype)
+        num = a.unsqueeze(-1) * num1 + b.unsqueeze(-1) * partial
+        den = a * den1 + b
+        return num / den.unsqueeze(-1)
 
     def _encode(self, input_ids: Tensor) -> Tensor:
-        """Shared encoder body for forward and forward_logits."""
+        """Shared encoder body: two-phase block-runner AttnRes."""
         n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = norm(x)
         x = self.smear(x)
-        # Precompute per-layer value embeddings
         ve = {}
         if self.ve_shared is not None:
             ve_base = self.ve_shared(input_ids)
@@ -702,30 +745,57 @@ class GPT(nn.Module):
                 ve[layer_idx] = ve_base * self.ve_layer_scales[idx].to(dtype=ve_base.dtype)
         cos = self.rope_cos.to(dtype=x.dtype)
         sin = self.rope_sin.to(dtype=x.dtype)
-        # Block AttnRes forward loop
-        # Each sublayer routes over completed block sums + current partial block.
-        # Sublayer outputs accumulate into partial_block; at block boundaries,
-        # partial_block is appended to blocks and a new block begins.
+
         layers_per_block = self.attn_res_block_size // 2
-        blocks: list[Tensor] = []
-        partial = x  # starts as embedding
+        completed_blocks: list[Tensor] = []
+        partial = x
+
         for i in range(n):
-            # --- Attention sublayer ---
-            h = self._block_attn_res(blocks, partial, self.attn_res_queries[2 * i])
-            # Block boundary: isolate embedding, then every layers_per_block layers
-            if i % layers_per_block == 0:
-                blocks.append(partial)
+            sublayer_in_block = i % layers_per_block
+
+            # --- Block boundary: run Phase 1 (batched inter-block attention) ---
+            if sublayer_in_block == 0:
+                completed_blocks.append(partial)
                 partial = None
+
+                prev_blocks = torch.stack(completed_blocks)
+                block_end = min(i + layers_per_block, n)
+                q_indices = []
+                for li in range(i, block_end):
+                    q_indices.extend([2 * li, 2 * li + 1])
+                q_block = self.attn_res_queries[q_indices].to(dtype=x.dtype)
+                inter_num, inter_den, inter_m = self._inter_block_phase(prev_blocks, q_block)
+
+            # --- Attention sublayer ---
+            s_idx = 2 * sublayer_in_block
+            if partial is None:
+                # First sublayer after boundary — no partial to merge
+                h = inter_num[s_idx] / inter_den[s_idx].unsqueeze(-1)
+            else:
+                h = self._merge_with_partial(
+                    inter_num[s_idx], inter_den[s_idx], inter_m[s_idx],
+                    partial, self.attn_res_queries[2 * i])
+
             attn_out = self.attns[i](norm(h),
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], cos, sin, v_embed=ve.get(i))
             partial = partial + attn_out if partial is not None else attn_out
+
             # --- MLP sublayer ---
-            h = self._block_attn_res(blocks, partial, self.attn_res_queries[2 * i + 1])
+            s_idx_mlp = s_idx + 1
+            h = self._merge_with_partial(
+                inter_num[s_idx_mlp], inter_den[s_idx_mlp], inter_m[s_idx_mlp],
+                partial, self.attn_res_queries[2 * i + 1])
             mlp_out = mlp(norm(h), self.mlp_up_bank[i], self.mlp_down_bank[i])
             partial = partial + mlp_out
-        # Final output routing
-        out = self._block_attn_res(blocks, partial, self.attn_res_queries[2 * n])
+
+        # Final output query
+        q_final = self.attn_res_queries[2 * n]
+        prev_blocks = torch.stack(completed_blocks)
+        final_num, final_den, final_m = self._inter_block_phase(
+            prev_blocks, q_final.unsqueeze(0).to(dtype=x.dtype))
+        out = self._merge_with_partial(
+            final_num[0], final_den[0], final_m[0], partial, q_final)
         return norm(out)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)

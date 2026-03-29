@@ -48,12 +48,14 @@ def log_param_table(model: nn.Module, log_fn) -> None:
             cat = "Bigram"
         elif "ve_shared" in name or "ve_layer" in name:
             cat = "Value embedding"
+        elif "attn_res" in name:
+            cat = "AttnRes routing"
         else:
             cat = "Scalars/control"
         buckets.setdefault(cat, []).append((name, p))
     # Fixed display order
     order = ["Attention banks", "MLP banks", "Token embedding",
-             "Bigram", "Value embedding", "Scalars/control"]
+             "Bigram", "Value embedding", "AttnRes routing", "Scalars/control"]
     rows = []
     total_params = sum(p.numel() for p in model.parameters())
     total_qbytes = 0
